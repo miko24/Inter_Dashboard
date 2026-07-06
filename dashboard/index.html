@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="Interactive dashboard for exploring superposition in VAE and standard bottleneck models. Visualize weight matrices, tune hyperparameters, and generate experiment reports." />
+  <title>VAE Superposition Dashboard</title>
+  <link rel="stylesheet" href="index.css" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔬</text></svg>" />
+</head>
+<body>
+
+<div class="dashboard">
+
+  <!-- ═══════════════════════════════════════════════════════════
+       Header
+       ═══════════════════════════════════════════════════════════ -->
+  <header class="header">
+    <div class="header__logo">
+      <div class="header__icon">🔬</div>
+      <div>
+        <div class="header__title">VAE Superposition Dashboard</div>
+        <div class="header__subtitle">Interpretability Research Tool</div>
+      </div>
+    </div>
+    <div class="header__status">
+      <span class="mode-badge">VAE</span>
+      <span class="status-dot"></span>
+      <span>Ready</span>
+    </div>
+  </header>
+
+  <!-- ═══════════════════════════════════════════════════════════
+       Left Sidebar — Parameter Controls
+       ═══════════════════════════════════════════════════════════ -->
+  <aside class="sidebar">
+
+    <!-- Model Type -->
+    <div class="card">
+      <div class="card__header">
+        <div class="card__icon">🧠</div>
+        <div class="card__title">Model Type</div>
+      </div>
+      <div class="toggle-group" id="model-type-toggle">
+        <button class="toggle-option active" data-model="vae">VAE Bottleneck</button>
+        <button class="toggle-option" data-model="standard">Standard</button>
+      </div>
+    </div>
+
+    <!-- Architecture -->
+    <div class="card">
+      <div class="card__header">
+        <div class="card__icon">🏗️</div>
+        <div class="card__title">Architecture</div>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label" for="n-features">
+          Number of Features (n)
+          <span class="form-label__value" id="display-n-features">256</span>
+        </label>
+        <input type="number" class="form-input" id="n-features" value="256"
+               min="4" max="2048" step="1"
+               oninput="document.getElementById('display-n-features').textContent=this.value" />
+      </div>
+
+      <div class="form-group">
+        <label class="form-label" for="hidden-dim">
+          Hidden Dimension
+          <span class="form-label__value" id="display-hidden-dim">2</span>
+        </label>
+        <input type="number" class="form-input" id="hidden-dim" value="2"
+               min="2" max="128" step="1"
+               oninput="document.getElementById('display-hidden-dim').textContent=this.value" />
+      </div>
+
+      <div class="form-group">
+        <label class="form-label" for="init-method">Weight Initialization</label>
+        <select class="form-select" id="init-method">
+          <option value="xavier_normal" selected>Xavier Normal (Default)</option>
+          <option value="xavier_uniform">Xavier Uniform</option>
+          <option value="kaiming_normal">Kaiming Normal (He)</option>
+          <option value="kaiming_uniform">Kaiming Uniform</option>
+          <option value="orthogonal">Orthogonal</option>
+          <option value="random_0.05">Random Normal (σ=0.05)</option>
+          <option value="zeros">Zeros</option>
+        </select>
+      </div>
+
+      <div class="form-group" style="display: flex; align-items: center; gap: 8px; margin-top: 12px;">
+        <input type="checkbox" id="normalize-weights" style="accent-color: var(--accent-2); width: 14px; height: 14px; cursor: pointer; margin: 0;" />
+        <label class="form-label" for="normalize-weights" style="margin: 0; cursor: pointer; font-size: 0.78rem;">Normalize Weights (Unit Norm)</label>
+      </div>
+    </div>
+
+    <!-- Data -->
+    <div class="card">
+      <div class="card__header">
+        <div class="card__icon">📊</div>
+        <div class="card__title">Data</div>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label" for="density">
+          Feature Density
+          <span class="form-label__value" id="display-density">50%</span>
+        </label>
+        <div class="form-range-wrapper">
+          <input type="range" class="form-range" id="density"
+                 min="0.01" max="1.0" step="0.01" value="0.5"
+                 data-display="display-density" data-format="percent" />
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label" for="importance-decay">
+          Importance Decay
+          <span class="form-label__value" id="display-importance-decay">0.50</span>
+        </label>
+        <div class="form-range-wrapper">
+          <input type="range" class="form-range" id="importance-decay"
+                 min="0.0" max="3.0" step="0.05" value="0.5"
+                 data-display="display-importance-decay" data-format="fixed2" />
+        </div>
+        <div class="importance-preview">
+          <canvas id="importance-canvas"></canvas>
+        </div>
+      </div>
+    </div>
+
+    <!-- Training -->
+    <div class="card">
+      <div class="card__header">
+        <div class="card__icon">⚡</div>
+        <div class="card__title">Training</div>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label" for="steps">
+          Training Steps
+          <span class="form-label__value" id="display-steps">5000</span>
+        </label>
+        <input type="number" class="form-input" id="steps" value="5000"
+               min="500" max="100000" step="500"
+               oninput="document.getElementById('display-steps').textContent=this.value" />
+      </div>
+
+      <div class="form-group">
+        <label class="form-label" for="batch-size">Batch Size</label>
+        <select class="form-select" id="batch-size">
+          <option value="128">128</option>
+          <option value="256">256</option>
+          <option value="512" selected>512</option>
+          <option value="1024">1024</option>
+          <option value="2048">2048</option>
+        </select>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label" for="learning-rate">
+          Learning Rate
+          <span class="form-label__value" id="display-lr">0.001</span>
+        </label>
+        <input type="number" class="form-input" id="learning-rate" value="0.001"
+               min="0.00001" max="0.1" step="0.0001"
+               oninput="document.getElementById('display-lr').textContent=parseFloat(this.value).toFixed(4)" />
+      </div>
+
+      <!-- VAE-only: Beta -->
+      <div class="form-group vae-only">
+        <label class="form-label" for="beta">
+          β (KL Weight)
+          <span class="form-label__value" id="display-beta">0.050</span>
+        </label>
+        <div class="form-range-wrapper">
+          <input type="range" class="form-range" id="beta"
+                 min="0.001" max="1.0" step="0.001" value="0.05"
+                 data-display="display-beta" data-format="fixed3" />
+        </div>
+      </div>
+
+      <!-- VAE-only: Beta Warmup -->
+      <div class="form-group vae-only">
+        <label class="form-label" for="beta-warmup">
+          β Warmup Steps
+          <span class="form-label__value" id="display-beta-warmup">2000</span>
+        </label>
+        <input type="number" class="form-input" id="beta-warmup" value="2000"
+               min="0" max="50000" step="100"
+               oninput="document.getElementById('display-beta-warmup').textContent=this.value" />
+      </div>
+
+      <!-- Time-Lapse (Evolution) -->
+      <div class="form-group" style="margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border-subtle);">
+        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;">
+          <label class="form-label" style="margin: 0; cursor: pointer;" for="enable-timelapse">Time-Lapse Snapshots</label>
+          <input type="checkbox" id="enable-timelapse" style="accent-color: var(--accent-2); width: 14px; height: 14px; cursor: pointer; margin: 0;" />
+        </div>
+        <div id="timelapse-settings" class="hidden">
+          <label class="form-label" for="snapshot-interval">
+            Snapshot Interval (Steps)
+            <span class="form-label__value" id="display-snapshot-interval">500</span>
+          </label>
+          <input type="number" class="form-input" id="snapshot-interval" value="500"
+                 min="10" max="50000" step="100"
+                 oninput="document.getElementById('display-snapshot-interval').textContent=this.value" />
+        </div>
+      </div>
+    </div>
+
+    <!-- Loss Function -->
+    <div class="card">
+      <div class="card__header">
+        <div class="card__icon">⚗️</div>
+        <div class="card__title">Loss Function</div>
+      </div>
+      
+      <div class="loss-editor" id="loss-editor">
+        <!-- Preset Selector -->
+        <div class="loss-preset-row">
+          <select class="form-select" id="loss-preset">
+            <!-- Options populated by JS -->
+          </select>
+        </div>
+
+        <!-- Live Syntax-Highlighted Preview -->
+        <div class="loss-live-preview" id="loss-live-preview">
+          <div class="loss-live-preview__label">Active Loss</div>
+          <div class="loss-live-preview__code" id="loss-preview-code">
+            <!-- Populated by JS -->
+          </div>
+        </div>
+
+        <!-- Code Editor — always visible -->
+        <div class="loss-code-editor" id="loss-code-editor">
+          <div class="loss-code-editor__header">
+            <span class="loss-code-editor__title">✏️ Edit Expression</span>
+            <span class="loss-code-editor__status" id="loss-editor-status"></span>
+          </div>
+          <div class="loss-code-editor__body">
+            <div class="loss-code-editor__highlight" id="loss-highlight-layer" aria-hidden="true"></div>
+            <textarea class="loss-code-editor__textarea" id="loss-textarea" 
+                      placeholder="Type your loss expression here..." 
+                      spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off"></textarea>
+          </div>
+          <div class="loss-validation" id="loss-validation"></div>
+          <div class="loss-actions">
+            <button class="btn-sm btn-reset" id="btn-loss-reset" title="Clear the editor">↺ Clear</button>
+            <button class="btn-sm btn-apply" id="btn-loss-apply" title="Validate and apply expression">✓ Apply</button>
+          </div>
+        </div>
+
+        <!-- Snippet Templates -->
+        <div class="loss-snippets">
+          <div class="loss-section-label">Snippets <span class="loss-section-hint">(click to insert)</span></div>
+          <div class="loss-snippet-list" id="loss-snippet-list">
+            <!-- Populated by JS -->
+          </div>
+        </div>
+
+        <!-- Variables Reference with inline docs -->
+        <div class="loss-variables">
+          <div class="loss-section-label">Variables <span class="loss-section-hint">(click to insert)</span></div>
+          <div class="loss-var-grid" id="loss-var-list">
+            <!-- Populated by JS -->
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Sweep Parameters -->
+    <div class="card sweep-only hidden" id="card-sweep">
+      <div class="card__header">
+        <div class="card__icon">🔁</div>
+        <div class="card__title">Sweep Ranges</div>
+      </div>
+
+      <!-- Density Range -->
+      <div class="form-group">
+        <label class="form-label">Density Sweep Range</label>
+        <div class="form-group-row">
+          <div style="flex:1;">
+            <span class="sub-label">Start</span>
+            <input type="number" class="form-input" id="sweep-density-start" value="0.1" min="0.01" max="1.0" step="0.05" autocomplete="off" />
+          </div>
+          <div style="flex:1;">
+            <span class="sub-label">Step</span>
+            <input type="number" class="form-input" id="sweep-density-step" value="0.3" min="0.05" max="0.5" step="0.05" autocomplete="off" />
+          </div>
+          <div style="flex:1;">
+            <span class="sub-label">End</span>
+            <input type="number" class="form-input" id="sweep-density-end" value="1.0" min="0.1" max="1.0" step="0.05" autocomplete="off" />
+          </div>
+        </div>
+      </div>
+
+      <!-- Importance Decay Range -->
+      <div class="form-group" style="margin-top: 12px;">
+        <label class="form-label">Importance Decay Range</label>
+        <div class="form-group-row">
+          <div style="flex:1;">
+            <span class="sub-label">Start</span>
+            <input type="number" class="form-input" id="sweep-decay-start" value="0.0" min="0.0" max="3.0" step="0.1" autocomplete="off" />
+          </div>
+          <div style="flex:1;">
+            <span class="sub-label">Step</span>
+            <input type="number" class="form-input" id="sweep-decay-step" value="1.0" min="0.1" max="2.0" step="0.1" autocomplete="off" />
+          </div>
+          <div style="flex:1;">
+            <span class="sub-label">End</span>
+            <input type="number" class="form-input" id="sweep-decay-end" value="2.0" min="0.0" max="3.0" step="0.1" autocomplete="off" />
+          </div>
+        </div>
+      </div>
+
+      <!-- Sweep Architecture Mode -->
+      <div class="form-group" style="margin-top: 12px;">
+        <label class="form-label" for="sweep-arch-mode">Architecture Sweep Mode</label>
+        <select class="form-select" id="sweep-arch-mode">
+          <option value="single" selected>Fixed Architecture (from sidebar)</option>
+          <option value="range">Range Sweep over Features</option>
+          <option value="custom">Custom Architecture List</option>
+        </select>
+      </div>
+
+      <!-- Feature Sweep Range (Hidden by default, shown for 'range') -->
+      <div class="form-group hidden" id="sweep-features-range-group" style="margin-top: 12px; border-left: 2px solid var(--accent-2); padding-left: 10px;">
+        <label class="form-label">Feature Sweep Range</label>
+        <div class="form-group-row">
+          <div style="flex:1;">
+            <span class="sub-label">Start</span>
+            <input type="number" class="form-input" id="sweep-features-start" value="64" min="4" max="2048" step="1" autocomplete="off" />
+          </div>
+          <div style="flex:1;">
+            <span class="sub-label">Step</span>
+            <input type="number" class="form-input" id="sweep-features-step" value="64" min="1" max="512" step="1" autocomplete="off" />
+          </div>
+          <div style="flex:1;">
+            <span class="sub-label">End</span>
+            <input type="number" class="form-input" id="sweep-features-end" value="256" min="4" max="2048" step="1" autocomplete="off" />
+          </div>
+        </div>
+      </div>
+
+      <!-- Custom Architecture List (Hidden by default, shown for 'custom') -->
+      <div class="form-group hidden" id="sweep-custom-list-group" style="margin-top: 12px; border-left: 2px solid var(--accent-2); padding-left: 10px;">
+        <label class="form-label" for="sweep-custom-list">
+          Custom Sweeps List
+          <span class="form-label__value" style="font-size: 0.65rem; background: rgba(6, 182, 212, 0.1); color: var(--info); text-transform: none;">features, hidden, runs</span>
+        </label>
+        <textarea class="form-input" id="sweep-custom-list" rows="3" style="font-family: var(--font-mono); font-size: 0.76rem; resize: vertical;" placeholder="4, 2, 4&#10;3, 2, 2" spellcheck="false" autocomplete="off"></textarea>
+      </div>
+
+      <!-- Sweep steps & Plot choice -->
+      <div class="form-group" style="margin-top: 12px;">
+        <label class="form-label" for="sweep-steps">Steps per Sweep Run</label>
+        <input type="number" class="form-input" id="sweep-steps" value="1000" min="100" max="10000" step="100" autocomplete="off" />
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">Grid Output Plots (Select Multiple)</label>
+        <div class="checkbox-list-container" id="sweep-plot-checkboxes" style="display: flex; flex-direction: column; gap: var(--space-xs); max-height: 150px; overflow-y: auto; background: var(--bg-input); border: 1px solid var(--border-subtle); padding: 8px var(--space-md); border-radius: var(--radius-sm);">
+          <!-- Dynamically populated with checkboxes in app.js -->
+        </div>
+      </div>
+
+      <div class="form-group" style="display: flex; align-items: center; gap: 8px; margin-top: 12px;">
+        <input type="checkbox" id="sweep-show-plots-global" style="accent-color: var(--accent-2); width: 14px; height: 14px; cursor: pointer; margin: 0;" />
+        <label class="form-label" for="sweep-show-plots-global" style="margin: 0; cursor: pointer; font-size: 0.78rem;">Show Plots inline by default</label>
+      </div>
+    </div>
+
+    <!-- Action Button -->
+    <button class="btn-primary" id="btn-train">
+      ▶ Train Model
+    </button>
+
+  </aside>
+
+  <!-- ═══════════════════════════════════════════════════════════
+       Main Content — Visualization
+       ═══════════════════════════════════════════════════════════ -->
+  <main class="main-content">
+
+    <!-- Mode Tabs -->
+    <div class="mode-tabs">
+      <button class="mode-tab active" id="tab-mode-single">🔍 Exploration Mode</button>
+      <button class="mode-tab" id="tab-mode-sweep">📊 Parameter Sweep Grid</button>
+    </div>
+
+    <!-- Workspace: Single Model Exploration -->
+    <div id="workspace-single" class="workspace-panel">
+      <!-- Plot Tabs -->
+      <div class="plot-tabs" id="plot-tabs">
+        <!-- Rendered dynamically after training -->
+      </div>
+
+      <!-- Plot Canvas -->
+      <div class="plot-canvas" id="plot-canvas">
+        <div class="plot-canvas__empty">
+          <div class="plot-canvas__empty-icon">📊</div>
+          <div class="plot-canvas__empty-text">No model trained yet</div>
+          <div class="plot-canvas__empty-hint">Configure parameters on the left and click "Train Model"</div>
+        </div>
+
+        <!-- Loading Overlay -->
+        <div class="loading-overlay hidden" id="loading-overlay">
+          <div class="spinner"></div>
+          <div class="loading-overlay__text">Loading...</div>
+        </div>
+      </div>
+      
+      <!-- Time-lapse playback controls -->
+      <div class="timeline-controls hidden" id="timeline-controls">
+        <button class="btn-gif" id="btn-generate-gif" title="Generate Time-Lapse GIF">
+          <span>🎬</span> Generate Time-Lapse GIF
+        </button>
+      </div>
+    </div>
+
+    <!-- Workspace: Grid Sweep -->
+    <div id="workspace-sweep" class="workspace-panel hidden">
+      <div class="sweep-header-actions" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: var(--space-md);">
+        <div class="sweep-info" style="display: flex; align-items: center; gap: var(--space-md);">
+          <div>
+            <span class="sweep-info__label">Grid Output Plot:</span>
+            <span class="sweep-info__value" id="sweep-active-plot-label">-</span>
+          </div>
+          <label class="sweep-show-all-label" style="display: flex; align-items: center; gap: 6px; cursor: pointer; margin-left: 12px; margin-bottom: 0;">
+            <input type="checkbox" id="sweep-toggle-all-plots" style="accent-color: var(--accent-2); width: 13px; height: 13px; cursor: pointer; margin: 0;" />
+            <span style="font-size: 0.75rem; color: var(--text-accent); font-weight: 600; user-select: none;">Show Plots Inline</span>
+          </label>
+        </div>
+        <button class="btn-secondary" id="btn-export-sweep" disabled style="padding: 6px 14px; font-size: 0.78rem; margin: 0; width: auto;">
+          📋 Export Sweep Results
+        </button>
+      </div>
+
+      <!-- Sweep Feature Tabs (for switching between feature count sweeps) -->
+      <div class="plot-tabs hidden" id="sweep-feature-tabs" style="margin-bottom: var(--space-md); border-bottom: 1px solid var(--border-subtle); padding-bottom: var(--space-xs);">
+        <!-- Rendered dynamically -->
+      </div>
+
+      <!-- Sweep Plot Tabs (for switching between selected plot types) -->
+      <div class="plot-tabs hidden" id="sweep-plot-tabs" style="margin-bottom: var(--space-md);">
+        <!-- Rendered dynamically -->
+      </div>
+
+      <!-- Sweep Results Filters -->
+      <div class="card hidden" id="sweep-filter-card" style="margin-bottom: var(--space-md); padding: 10px var(--space-md); display: flex; flex-wrap: wrap; gap: var(--space-md); align-items: center;">
+        <div style="font-size: 0.75rem; font-weight: bold; color: var(--text-accent); display: flex; align-items: center; gap: 4px;">
+          <span>🔍</span> Filter Results:
+        </div>
+        <div style="display: flex; flex-wrap: wrap; gap: var(--space-md); align-items: center; flex: 1;">
+          <div style="display: flex; align-items: center; gap: 6px;">
+            <span style="font-size: 0.72rem; color: var(--text-muted); white-space: nowrap;">Min Density:</span>
+            <input type="number" class="form-input" id="filter-min-density" placeholder="0.0" min="0.0" max="1.0" step="0.05" style="width: 65px; padding: 4px 6px; font-size: 0.72rem; height: 26px; margin: 0;" autocomplete="off" />
+          </div>
+          <div style="display: flex; align-items: center; gap: 6px;">
+            <span style="font-size: 0.72rem; color: var(--text-muted); white-space: nowrap;">Min Decay:</span>
+            <input type="number" class="form-input" id="filter-min-decay" placeholder="0.0" min="0.0" max="3.0" step="0.1" style="width: 65px; padding: 4px 6px; font-size: 0.72rem; height: 26px; margin: 0;" autocomplete="off" />
+          </div>
+          <div style="display: flex; align-items: center; gap: 6px;">
+            <span style="font-size: 0.72rem; color: var(--text-muted); white-space: nowrap;">Max Loss:</span>
+            <input type="number" class="form-input" id="filter-max-loss" placeholder="10.0" min="0.0" step="0.05" style="width: 75px; padding: 4px 6px; font-size: 0.72rem; height: 26px; margin: 0;" autocomplete="off" />
+          </div>
+          <div style="display: flex; align-items: center; gap: 6px;">
+            <span style="font-size: 0.72rem; color: var(--text-muted); white-space: nowrap;">Min Norm:</span>
+            <input type="number" class="form-input" id="filter-min-norm" placeholder="0.0" min="0.0" step="0.05" style="width: 75px; padding: 4px 6px; font-size: 0.72rem; height: 26px; margin: 0;" autocomplete="off" />
+          </div>
+          <button class="btn-secondary" id="btn-reset-filters" style="padding: 4px 8px; font-size: 0.7rem; width: auto; margin: 0; margin-left: auto; height: 26px; line-height: 1;">
+            Reset
+          </button>
+        </div>
+      </div>
+
+      <div class="plot-canvas" id="sweep-canvas" style="display: flex; flex-direction: column; overflow: auto; min-height: 500px; padding: 20px;">
+        <div class="plot-canvas__empty" id="sweep-empty">
+          <div class="plot-canvas__empty-icon">📊</div>
+          <div class="plot-canvas__empty-text">No grid sweep executed yet</div>
+          <div class="plot-canvas__empty-hint">Configure sweep ranges on the left and click "Run Sweep Analysis"</div>
+        </div>
+
+        <div class="sweep-progress-container hidden" id="sweep-progress-container">
+          <div class="sweep-progress-bar">
+            <div class="sweep-progress-fill" id="sweep-progress-fill" style="width: 0%"></div>
+          </div>
+          <div class="sweep-progress-text" id="sweep-progress-text">Training models...</div>
+        </div>
+
+        <!-- This is where the interactive grid is rendered -->
+        <div id="sweep-grid-wrapper" class="sweep-grid-wrapper hidden">
+          <!-- Dynamically populated -->
+        </div>
+      </div>
+    </div>
+
+  </main>
+
+  <!-- ═══════════════════════════════════════════════════════════
+       Right Panel — Statistics & Report
+       ═══════════════════════════════════════════════════════════ -->
+  <aside class="stats-panel">
+
+    <div class="card">
+      <div class="card__header">
+        <div class="card__icon">📈</div>
+        <div class="card__title">Training Results</div>
+      </div>
+      <div id="stats-content">
+        <div class="stat-row">
+          <span class="stat-label">No model trained yet</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card__header">
+        <div class="card__icon">🕰️</div>
+        <div class="card__title" style="flex: 1;">Past Experiments</div>
+        <button class="btn-sm btn-secondary" id="btn-refresh-experiments" style="padding: 2px 6px; font-size: 0.7rem; width: auto;" title="Refresh List">↻</button>
+      </div>
+      <div class="past-experiments-list" id="past-experiments-list" style="max-height: 200px; overflow-y: auto; margin-top: 8px; display: flex; flex-direction: column; gap: 4px;">
+        <div class="stat-row">
+          <span class="stat-label">No past experiments found.</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card__header">
+        <div class="card__icon">📑</div>
+        <div class="card__title">Report</div>
+      </div>
+      <p style="font-size:0.78rem; color:var(--text-muted); margin-bottom:var(--space-md);">
+        Generate a detailed report with all parameters, statistics, and interference analysis.
+      </p>
+      <button class="btn-secondary" id="btn-report">
+        📋 Generate Report
+      </button>
+    </div>
+
+    <div class="card">
+      <div class="card__header">
+        <div class="card__icon">💡</div>
+        <div class="card__title">Quick Guide</div>
+      </div>
+      <div style="font-size:0.75rem; color:var(--text-secondary); line-height:1.7;">
+        <p><strong style="color:var(--text-accent);">1.</strong> Choose model type (VAE or Standard)</p>
+        <p><strong style="color:var(--text-accent);">2.</strong> Set hidden dim, features, density</p>
+        <p><strong style="color:var(--text-accent);">3.</strong> Click <em>Train Model</em></p>
+        <p><strong style="color:var(--text-accent);">4.</strong> Browse plot tabs to visualize weights</p>
+        <p><strong style="color:var(--text-accent);">5.</strong> Generate a report for the experiment</p>
+        <hr style="border:none;border-top:1px solid var(--border-subtle);margin:8px 0;" />
+        <p style="color:var(--text-muted);">
+          <strong>Hidden = 2:</strong> Arrow plots in 2D space<br/>
+          <strong>Hidden > 2:</strong> PCA projection + heatmap
+        </p>
+      </div>
+    </div>
+
+  </aside>
+
+</div>
+
+<!-- Toast container -->
+<div class="toast-container"></div>
+
+<!-- Lightbox modal for grid plot expansion -->
+<div class="lightbox hidden" id="lightbox" onclick="this.classList.add('hidden')">
+  <div class="lightbox__content" onclick="event.stopPropagation()">
+    <img src="" id="lightbox-img" alt="Enlarged visualization" />
+    <div class="lightbox__caption" id="lightbox-caption">Density: 0.5 | Importance Decay: 1.0</div>
+  </div>
+  <button class="lightbox__close" onclick="document.getElementById('lightbox').classList.add('hidden')">✕</button>
+</div>
+
+<script src="app.js"></script>
+
+</body>
+</html>
