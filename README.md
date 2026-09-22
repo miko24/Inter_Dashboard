@@ -8,8 +8,13 @@ manifold representation learning.
 ```powershell
 cd dashboard
 python -m pip install -r requirements.txt
-python server.py
+.\start_dashboard.ps1
 ```
+
+On the Codex desktop workspace, `start_dashboard.ps1` automatically selects
+the bundled Python runtime. The launcher disables Flask's debug reloader so the
+persistent training-queue worker is started only once. If port 5000 is already
+in use by the dashboard, it reports the existing server and exits cleanly.
 
 Open `http://localhost:5000`. The unified workspace opens directly on
 **Experiments & Data**; model building, training, geometry, representation,
