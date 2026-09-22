@@ -1,5 +1,14 @@
 flask
 flask-cors
 torch
+torchvision
 numpy
 matplotlib
+Pillow
+networkx
+scikit-learn
+scipy
+umap-learn
+ripser
+PyYAML
+h5py

@@ -1,0 +1,43 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+dashboard/.runtime/
+dashboard/.vendor*/
+
+# Dashboard-generated state and downloaded datasets
+dashboard/experiments/
+dashboard/temp_sweep/
+dashboard/server.stdout.log
+dashboard/server.stderr.log
+*.mslab
+
+# Generated research artifacts and previews
+output/
+plots/
+reports/
+graphify-out/
+tmp/
+_qa_*/
+gram_*-summary.json
+Dashboard_Analysis_*.docx
+
+# Locally downloaded paper references
+Papers/
+
+# One-off document rendering/build helpers
+_build_*.py
+_render_*.py
+_render_*.js
+_export_*.ps1
+_native_*.ps1
+
+# Editor and operating-system noise
+.DS_Store
+Thumbs.db
+*.swp
+*.tmp

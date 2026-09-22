@@ -6,9 +6,11 @@
   <meta name="description" content="Interactive dashboard for exploring superposition in VAE and standard bottleneck models. Visualize weight matrices, tune hyperparameters, and generate experiment reports." />
   <title>VAE Superposition Dashboard</title>
   <link rel="stylesheet" href="index.css" />
+  <link rel="stylesheet" href="geometry.css" />
+  <link rel="stylesheet" href="orthogonality.css" />
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔬</text></svg>" />
 </head>
-<body>
+<body class="geometry-mode">
 
 <div class="dashboard">
 
@@ -19,12 +21,12 @@
     <div class="header__logo">
       <div class="header__icon">🔬</div>
       <div>
-        <div class="header__title">VAE Superposition Dashboard</div>
-        <div class="header__subtitle">Interpretability Research Tool</div>
+        <div class="header__title">Manifold Superposition Lab</div>
+        <div class="header__subtitle">Unified experiment, training, and geometry workspace</div>
       </div>
     </div>
     <div class="header__status">
-      <span class="mode-badge">VAE</span>
+      <span class="mode-badge">LAB</span>
       <span class="status-dot"></span>
       <span>Ready</span>
     </div>
@@ -43,6 +45,7 @@
       </div>
       <div class="toggle-group" id="model-type-toggle">
         <button class="toggle-option active" data-model="vae">VAE Bottleneck</button>
+        <button class="toggle-option" data-model="manifold_vae">Manifold VAE</button>
         <button class="toggle-option" data-model="standard">Standard</button>
       </div>
     </div>
@@ -90,6 +93,28 @@
       <div class="form-group" style="display: flex; align-items: center; gap: 8px; margin-top: 12px;">
         <input type="checkbox" id="normalize-weights" style="accent-color: var(--accent-2); width: 14px; height: 14px; cursor: pointer; margin: 0;" />
         <label class="form-label" for="normalize-weights" style="margin: 0; cursor: pointer; font-size: 0.78rem;">Normalize Weights (Unit Norm)</label>
+      </div>
+
+      <!-- Manifold-only: Manifold Type -->
+      <div class="form-group manifold-vae-only hidden" style="margin-top: 12px; border-top: 1px solid var(--border-subtle); padding-top: 12px;">
+        <label class="form-label" for="manifold-type">Manifold Geometry</label>
+        <select class="form-select" id="manifold-type">
+          <option value="poincare" selected>Poincaré Ball (- Curvature)</option>
+          <option value="sphere">Stereographic Sphere (+ Curvature)</option>
+        </select>
+      </div>
+
+      <!-- Manifold-only: Curvature -->
+      <div class="form-group manifold-vae-only hidden">
+        <label class="form-label" for="curvature">
+          Curvature Magnitude (c)
+          <span class="form-label__value" id="display-curvature">1.00</span>
+        </label>
+        <div class="form-range-wrapper">
+          <input type="range" class="form-range" id="curvature"
+                 min="0.1" max="5.0" step="0.1" value="1.0"
+                 data-display="display-curvature" data-format="fixed2" />
+        </div>
       </div>
     </div>
 
@@ -188,6 +213,19 @@
         <input type="number" class="form-input" id="beta-warmup" value="2000"
                min="0" max="50000" step="100"
                oninput="document.getElementById('display-beta-warmup').textContent=this.value" />
+      </div>
+
+      <!-- Manifold-only: Tangent Penalty Weight -->
+      <div class="form-group manifold-vae-only hidden" style="margin-top: 12px; border-top: 1px solid var(--border-subtle); padding-top: 12px;">
+        <label class="form-label" for="tangent-weight">
+          Tangent Penalty Weight
+          <span class="form-label__value" id="display-tangent-weight">0.010</span>
+        </label>
+        <div class="form-range-wrapper">
+          <input type="range" class="form-range" id="tangent-weight"
+                 min="0.0" max="0.5" step="0.001" value="0.01"
+                 data-display="display-tangent-weight" data-format="fixed3" />
+        </div>
       </div>
 
       <!-- Time-Lapse (Evolution) -->
@@ -382,18 +420,42 @@
        ═══════════════════════════════════════════════════════════ -->
   <main class="main-content">
 
-    <!-- Mode Tabs -->
-    <div class="mode-tabs">
-      <button class="mode-tab active" id="tab-mode-single">🔍 Exploration Mode</button>
-      <button class="mode-tab" id="tab-mode-sweep">📊 Parameter Sweep Grid</button>
-    </div>
+    <!-- One persistent navigation for the complete research workflow. -->
+    <nav class="unified-nav" aria-label="Research workflow">
+      <div class="unified-nav__group"><b>PLAN</b>
+        <button class="unified-nav__item active" data-workspace="geometry" data-geometry-view="data"><span>01</span>Paper & Data</button>
+        <button class="unified-nav__item" data-workspace="geometry" data-geometry-view="models"><span>02</span>Model Protocol</button>
+        <button class="unified-nav__item" data-workspace="geometry" data-geometry-view="plan"><span>03</span>Analysis Plan</button>
+      </div>
+      <div class="unified-nav__group unified-nav__group--run"><b>RUN</b>
+        <button class="unified-nav__item" data-workspace="geometry" data-geometry-view="training"><span>04</span>Train & Analyze</button>
+      </div>
+      <div class="unified-nav__group"><b>RESULTS</b>
+        <button class="unified-nav__item" data-workspace="geometry" data-geometry-view="representation" data-analysis-result="representation"><span>05</span>Overview</button>
+        <button class="unified-nav__item" data-workspace="geometry" data-geometry-view="decoder" data-analysis-result="decoder_geometry"><span>06</span>Decoder</button>
+        <button class="unified-nav__item" data-workspace="geometry" data-geometry-view="metrics" data-analysis-result="tangent_metrics"><span>07</span>Scientific Metrics</button>
+        <button class="unified-nav__item" data-workspace="geometry" data-geometry-view="explorer" data-analysis-result="latent_explorer"><span>08</span>Latent Space</button>
+        <button class="unified-nav__item" data-workspace="geometry" data-geometry-view="traversal" data-analysis-result="factor_traversal"><span>09</span>Traversal</button>
+      </div>
+      <div class="unified-nav__group"><b>MORE</b>
+        <button class="unified-nav__item" data-workspace="geometry" data-geometry-view="sweeps"><span>10</span>Sweeps</button>
+        <button class="unified-nav__item" data-workspace="geometry" data-geometry-view="compare"><span>11</span>Compare</button>
+        <button class="unified-nav__item" data-workspace="geometry" data-geometry-view="datasets"><span>12</span>Imports</button>
+        <button class="unified-nav__item" id="tab-mode-single" data-workspace="single"><span>13</span>Feature Simulation</button>
+        <button class="unified-nav__item" id="tab-mode-sweep" data-workspace="sweep"><span>14</span>Classic Sweep</button>
+        <button class="unified-nav__item" id="tab-mode-orthogonality" data-workspace="orthogonality"><span>15</span>Gram Experiment</button>
+      </div>
+    </nav>
 
     <!-- Workspace: Single Model Exploration -->
-    <div id="workspace-single" class="workspace-panel">
+    <div id="workspace-single" class="workspace-panel hidden">
       <!-- Plot Tabs -->
       <div class="plot-tabs" id="plot-tabs">
         <!-- Rendered dynamically after training -->
       </div>
+
+      <!-- Plot Explanation Panel (populated by JS) -->
+      <div id="plot-explanation-container"></div>
 
       <!-- Plot Canvas -->
       <div class="plot-canvas" id="plot-canvas">
@@ -495,6 +557,13 @@
       </div>
     </div>
 
+    <!-- Full-width compositional manifold research workspace. Its content is
+         rendered by geometry.js to keep the legacy dashboard maintainable. -->
+    <div id="workspace-geometry" class="workspace-panel"></div>
+
+    <!-- Exact density/importance/ambient-dimension VAE Gram comparison. -->
+    <div id="workspace-orthogonality" class="workspace-panel hidden"></div>
+
   </main>
 
   <!-- ═══════════════════════════════════════════════════════════
@@ -576,6 +645,9 @@
 </div>
 
 <script src="app.js"></script>
+<script src="geometry.js"></script>
+<script src="orthogonality.js"></script>
+<script src="help_system.js"></script>
 
 </body>
 </html>

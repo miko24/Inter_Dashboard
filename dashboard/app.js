@@ -188,18 +188,35 @@ function initModelTypeToggle() {
 function updateConditionalFields() {
   const vaeFields = $$(".vae-only");
   vaeFields.forEach((el) => {
-    if (state.modelType === "vae") {
+    if (state.modelType === "vae" || state.modelType === "manifold_vae") {
       el.classList.remove("disabled");
     } else {
       el.classList.add("disabled");
     }
   });
+
+  const manifoldFields = $$(".manifold-vae-only");
+  manifoldFields.forEach((el) => {
+    if (state.modelType === "manifold_vae") {
+      el.classList.remove("hidden");
+    } else {
+      el.classList.add("hidden");
+    }
+  });
+
+  if (state.modelType === "manifold_vae") {
+    document.body.classList.add("manifold-vae-active");
+  } else {
+    document.body.classList.remove("manifold-vae-active");
+  }
 }
 
 function updateModeBadge() {
   const badge = $(".mode-badge");
   if (badge) {
-    badge.textContent = state.modelType === "vae" ? "VAE" : "STD";
+    if (state.modelType === "vae") badge.textContent = "VAE";
+    else if (state.modelType === "manifold_vae") badge.textContent = "MANIFOLD";
+    else badge.textContent = "STD";
   }
 }
 
@@ -312,6 +329,20 @@ function getConfig() {
     use_importance: true,
   };
   
+  if (state.modelType === "manifold_vae") {
+    config.manifold_type = $("#manifold-type")?.value ?? "poincare";
+    config.curvature = parseFloat($("#curvature")?.value ?? 1.0);
+    config.tangent_weight = parseFloat($("#tangent-weight")?.value ?? 0.01);
+    
+    // Attempt to extract loss preset
+    const preset = $("#loss-preset");
+    if (preset && preset.value && preset.value !== "custom") {
+        config.manifold_loss_type = preset.value;
+    } else {
+        config.manifold_loss_type = "riemannian_kl"; // fallback
+    }
+  }
+  
   if ($("#enable-timelapse")?.checked) {
     config.snapshot_interval = parseInt($("#snapshot-interval")?.value ?? 500);
   }
@@ -398,7 +429,499 @@ const PLOT_LABELS = {
   graph_W: "W Graph",
   graph_W_mu: "W_μ Graph",
   graph_W_logvar: "W_logvar Graph",
+  coord_graph_W: "W Coord Graph",
+  coord_graph_W_mu: "W_μ Coord Graph",
+  coord_graph_W_logvar: "W_logvar Coord Graph",
+  manifold_jacobian_W: "W Jacobian",
+  manifold_jacobian_W_mu: "W_μ Jacobian",
+  manifold_geometry_W: "W Geometry",
+  manifold_geometry_W_mu: "W_μ Geometry",
+  manifold_summary_W: "W Manifold Summary",
+  manifold_summary_W_mu: "W_μ Manifold Summary",
+  
+  // Manifold VAE Specific
+  arrows_W_tangent: "W_tangent Arrows",
+  manifold_disk_scatter: "Manifold Disk",
+  manifold_combined: "Combined Manifold",
+  geodesic_matrix: "Geodesic Matrix",
+  curvature_heatmap: "Curvature λ(x)",
+  heatmap_W_tangent: "W_tangent Heatmap",
+  pca_W_tangent: "W_tangent PCA",
+  interference_W_tangent: "W_tangent Interference",
+  norms_W_tangent: "W_tangent Norms",
+  graph_W_tangent: "W_tangent Graph",
+  coord_graph_W_tangent: "W_tangent Coord Graph",
+  manifold_jacobian_W_tangent: "W_tangent Jacobian",
+  manifold_geometry_W_tangent: "W_tangent Geometry",
+  manifold_summary_W_tangent: "W_tangent Manifold",
 };
+
+// ═══════════════════════════════════════════════════════════════
+// Plot Explanations — Theory + Interpretation Guide
+// ═══════════════════════════════════════════════════════════════
+const PLOT_EXPLANATIONS = {
+  // ── Arrow plots (2D hidden) ──
+  arrows_W: {
+    title: "Weight Arrows — W (tied weights)",
+    theory: "Each arrow represents one feature's weight vector <code>w_i ∈ ℝ²</code> in the bottleneck. In the Elhage et al. (2022) toy model, the network learns to encode <strong>n features into just 2 hidden dimensions</strong>. The direction of each arrow shows where that feature is represented in the latent space; the length (norm) indicates how strongly the model commits to encoding it.",
+    intuition: "<strong>Look for:</strong> If arrows spread evenly around the circle, the model is using <strong>superposition</strong> — packing more features than dimensions allow by using non-orthogonal directions. If only 2 arrows are large (aligned with axes), the model uses a <strong>dedicated basis</strong> with no superposition. Short arrows = features the model has chosen to ignore (low-importance features). Arrows that nearly overlap indicate <strong>interference</strong> between those features."
+  },
+  arrows_W_mu: {
+    title: "Weight Arrows — W_μ (mean encoder)",
+    theory: "The <code>W_μ</code> matrix maps inputs to the <strong>mean of the approximate posterior</strong> q(z|x). Each column is a feature's encoding direction in the VAE's latent space. Unlike the standard bottleneck, the VAE has a separate variance pathway, so W_μ captures only the 'where to encode' decision, not 'how certain.'",
+    intuition: "<strong>Interpretation is similar to W arrows</strong>, but now the arrows represent the <em>deterministic component</em> of the encoding. Evenly spread arrows = superposition in the mean space. Compare with <strong>W_logvar arrows</strong> to see if the model encodes uncertainty differently for different features. Features with large W_μ norms but small W_logvar norms are encoded with <strong>high confidence</strong>."
+  },
+  arrows_W_logvar: {
+    title: "Weight Arrows — W_logvar (variance encoder)",
+    theory: "The <code>W_logvar</code> matrix maps inputs to the <strong>log-variance of the approximate posterior</strong>. This determines how much noise is injected per latent dimension for each feature. It controls the <strong>information bottleneck</strong> — large variance = more noise = less information transmitted.",
+    intuition: "<strong>Key insight:</strong> Features with large W_logvar norms have <strong>high variance</strong> (more noise), meaning the model is less certain about them. If W_logvar arrows are small/near zero, the model acts almost deterministically (like a standard autoencoder). If W_logvar arrows point in <em>different directions</em> than W_μ, the model applies anisotropic noise — critical for understanding superposition under uncertainty."
+  },
+  arrows_W_tangent: {
+    title: "Weight Arrows — W_tangent (tangent space)",
+    theory: "In the manifold VAE, <code>W_tangent</code> maps inputs into the <strong>tangent space at the origin</strong> of the chosen manifold (Poincaré ball or sphere). This is then projected onto the manifold via the exponential map. The tangent space is Euclidean, so these arrows behave like standard weight vectors but are interpreted as velocities on the manifold.",
+    intuition: "<strong>Compare with standard arrows:</strong> Similar spread patterns indicate superposition, but the actual latent representations will be distorted by the manifold's curvature. Arrows near the origin produce latent points near the manifold center (low curvature region); large-norm arrows push points toward the boundary where geodesic distances diverge."
+  },
+
+  // ── z Samples ──
+  z_samples: {
+    title: "Latent Space Samples — z",
+    theory: "This scatter plot shows samples from the <strong>reparameterized posterior</strong> z = μ + ε·σ. Each point is a latent representation of one input. The distribution of z reveals how the model uses its latent space — whether it's concentrated, spread out, or has structure.",
+    intuition: "<strong>Look for:</strong> A <strong>circular cloud</strong> centered at origin suggests the KL term is regularizing well toward the N(0,I) prior. An <strong>elongated or multi-modal</strong> distribution means certain latent directions carry more information. If z samples form <strong>rays or clusters</strong>, the model has learned distinct encoding modes. Compare with the W_μ arrows — z samples should cluster along the directions defined by the large weight vectors."
+  },
+
+  // ── Combined ──
+  combined: {
+    title: "Combined View — Weights + Latent Samples",
+    theory: "Overlays <code>W_μ</code> (plasma colormap), <code>W_logvar</code> (viridis colormap), and <strong>z samples</strong> (gray dots) in one plot. This gives the complete picture of how features are encoded and where latent samples actually land.",
+    intuition: "<strong>The key plot for understanding superposition:</strong> Do the z samples align with the weight arrow directions? If yes, the model successfully encodes those features. If z samples avoid certain directions, those features may be <strong>suppressed by the KL term</strong>. The gap between W_μ arrows and z cloud extent shows how much the variance (W_logvar) is blurring the encoding."
+  },
+  manifold_combined: {
+    title: "Combined Manifold View",
+    theory: "Overlays <code>W_tangent</code> arrows with <strong>z samples on the manifold disk</strong>. For Poincaré manifolds, the disk boundary represents infinity — samples near the edge are geodesically far from the origin.",
+    intuition: "<strong>Look for:</strong> How weight arrows relate to the distribution of z on the manifold. Points clustered near the center live in a nearly-Euclidean region. Points near the boundary exploit the manifold's curvature for <strong>hierarchical</strong> or <strong>tree-like</strong> representations. The unit circle (Poincaré boundary) should not be crossed by z samples."
+  },
+
+  // ── Interference ──
+  interference_W: {
+    title: "Interference Matrix — WᵀW",
+    theory: "The <strong>Gram matrix</strong> <code>WᵀW</code> encodes pairwise dot products between all feature weight vectors. Diagonal entries are squared norms (how strongly each feature is represented). Off-diagonal entries measure <strong>interference</strong> — how much reconstructing one feature corrupts another.",
+    intuition: "<strong>Ideal case:</strong> A diagonal matrix (no interference, orthogonal features). In superposition, off-diagonal entries are nonzero — this is the <strong>cost of packing more features than dimensions</strong>. The right panel (off-diagonal only) isolates interference: bright spots indicate feature pairs that strongly interfere. <strong>Blue = negative interference</strong> (anti-correlated reconstruction errors), <strong>red = positive interference</strong>."
+  },
+  interference_W_mu: {
+    title: "Interference Matrix — W_μᵀW_μ",
+    theory: "Same as W interference but for the <strong>mean encoder only</strong>. Measures how much the mean encoding directions of different features overlap. High off-diagonal values mean the VAE's posterior means for two features are <strong>entangled</strong>.",
+    intuition: "<strong>Compare with W interference in standard models.</strong> The VAE's KL regularization may <em>reduce</em> interference by pushing features toward orthogonality, or <em>increase</em> it by compressing the representation. A block-diagonal structure suggests <strong>feature grouping</strong> — the model clusters related features."
+  },
+  interference_W_logvar: {
+    title: "Interference Matrix — W_logvarᵀW_logvar",
+    theory: "Gram matrix for the variance encoder. Shows whether features share <strong>noise directions</strong>. If two features have similar W_logvar vectors, the VAE adds correlated noise to both — they share the same uncertainty structure.",
+    intuition: "<strong>Often more uniform than W_μ interference</strong> because the model may use a simpler variance structure. A near-uniform matrix means the model applies similar noise everywhere. Strong off-diagonal structure means the model has learned <strong>feature-specific uncertainty patterns</strong>."
+  },
+  interference_W_tangent: {
+    title: "Interference Matrix — W_tangentᵀW_tangent",
+    theory: "Gram matrix for the tangent-space encoder of the manifold VAE. In tangent space, dot products are Euclidean, so this measures geometric overlap before the exponential map projects to the manifold.",
+    intuition: "<strong>Note:</strong> Tangent-space interference does not directly translate to interference on the manifold due to curvature effects. Two features with similar tangent vectors may end up geodesically far apart near the boundary. Use alongside the <strong>Geodesic Matrix</strong> for the full picture."
+  },
+
+  // ── Norms ──
+  norms_W: {
+    title: "Weight Norms — ‖wᵢ‖",
+    theory: "Bar chart of per-feature weight vector norms, sorted by magnitude. The norm <code>‖wᵢ‖</code> determines how strongly feature i is represented in the bottleneck. In the Elhage et al. framework, the model makes a <strong>binary decision</strong> per feature: represent it (large norm) or discard it (zero norm).",
+    intuition: "<strong>Look for a sharp cutoff</strong> between 'active' features (norm > 0) and 'dead' features (norm ≈ 0). The transition point reveals the model's <strong>effective capacity</strong>. The histogram (right panel) shows the distribution — a bimodal distribution (peaks at 0 and ~1) indicates clean superposition. A smooth gradient suggests the model is hedging on which features to keep."
+  },
+  norms_W_mu: {
+    title: "Weight Norms — ‖w_μᵢ‖",
+    theory: "Per-feature norms of the mean encoder. Determines how far from the origin each feature pushes the posterior mean — equivalently, how much <strong>signal</strong> each feature contributes to the latent code.",
+    intuition: "<strong>Same interpretation as W norms</strong>, but remember that features with large W_μ norms but also large W_logvar norms may still be <strong>noisy</strong> (high signal-to-noise requires large μ / small σ). The histogram shape tells you if the VAE has learned a cleaner or messier feature selection than a standard bottleneck."
+  },
+  norms_W_logvar: {
+    title: "Weight Norms — ‖w_logvarᵢ‖",
+    theory: "Per-feature norms of the log-variance encoder. Controls how much <strong>posterior noise</strong> each feature induces. Larger norms = the model's posterior variance is more feature-dependent.",
+    intuition: "<strong>If all norms are similar</strong>, the model uses isotropic noise (all features equally uncertain). <strong>If some norms are much larger</strong>, those features drive high-variance latent directions — the model is <em>uncertain</em> about them or intentionally injecting noise to prevent overfitting. Compare with W_μ norms: the ratio ‖w_μ‖/‖w_logvar‖ approximates per-feature SNR."
+  },
+  norms_W_tangent: {
+    title: "Weight Norms — ‖w_tangentᵢ‖",
+    theory: "Per-feature norms in the tangent space encoder. Determines how far from the origin each feature's tangent vector reaches before being mapped to the manifold.",
+    intuition: "<strong>For Poincaré manifolds</strong>, large tangent norms push the exponential map output toward the disk boundary, where distances grow exponentially. This means high-norm features are encoded in a region with <strong>much more representational capacity</strong> — the manifold provides an implicit feature importance weighting."
+  },
+
+  // ── Heatmaps (hidden > 2) ──
+  heatmap_W: {
+    title: "Weight Heatmap — W",
+    theory: "Visualizes the raw <code>W</code> matrix as a 2D heatmap (hidden dimensions × features). Each cell shows the weight connecting one hidden unit to one feature. Red = positive, blue = negative, white = zero.",
+    intuition: "<strong>For high-dimensional hidden spaces:</strong> Look for <strong>column patterns</strong> — features with similar color profiles across hidden dims are encoded similarly (potential interference). <strong>Sparse columns</strong> (mostly white) indicate features the model barely represents. <strong>Row patterns</strong> show which hidden dimensions specialize in which features."
+  },
+  heatmap_W_mu: {
+    title: "Weight Heatmap — W_μ",
+    theory: "Raw heatmap of the mean encoder matrix for hidden > 2. Each row is a hidden dimension, each column is a feature.",
+    intuition: "<strong>Same as W heatmap interpretation.</strong> Structured patterns (stripes, blocks) indicate learned organization. Noisy-looking rows may indicate dimensions the model hasn't fully utilized."
+  },
+  heatmap_W_logvar: {
+    title: "Weight Heatmap — W_logvar",
+    theory: "Raw heatmap of the log-variance encoder matrix. Shows how each feature contributes to the posterior variance in each latent dimension.",
+    intuition: "<strong>Often less structured than W_μ.</strong> Uniform values = isotropic noise. Structured patterns reveal feature-dependent noise shaping."
+  },
+  heatmap_W_tangent: {
+    title: "Weight Heatmap — W_tangent",
+    theory: "Raw heatmap of the tangent-space projection matrix for manifold VAE with hidden > 2.",
+    intuition: "<strong>Interpretation combines standard heatmap reading with manifold awareness.</strong> The actual latent representations will be nonlinearly transformed by the exponential map."
+  },
+
+  // ── PCA (hidden > 2) ──
+  pca_W: {
+    title: "PCA Projection — W",
+    theory: "Projects the high-dimensional weight vectors onto their <strong>top 2 principal components</strong>. This gives the best 2D view of how features are arranged in the hidden space. The percentage labels show how much variance each PC captures.",
+    intuition: "<strong>Interpret like the 2D arrow plot</strong>, but remember this is a projection — features that appear close may actually be separated in other dimensions. If PC1+PC2 capture >90% of variance, the model is effectively using only 2 dimensions despite having more. Low explained variance means the features are spread across many dimensions (rich representation)."
+  },
+  pca_W_mu: {
+    title: "PCA Projection — W_μ",
+    theory: "PCA projection of the high-dimensional mean encoder weight vectors onto their top 2 PCs.",
+    intuition: "<strong>Same as W PCA.</strong> Compare explained variance percentages between W_μ and W_logvar to understand if the model uses different effective dimensionalities for mean vs. variance encoding."
+  },
+  pca_W_logvar: {
+    title: "PCA Projection — W_logvar",
+    theory: "PCA projection of the log-variance encoder weight vectors.",
+    intuition: "<strong>If explained variance is very high (>95%)</strong>, the variance structure is essentially low-dimensional even if the hidden space is large — the model is not fully utilizing variance capacity."
+  },
+  pca_W_tangent: {
+    title: "PCA Projection — W_tangent",
+    theory: "PCA projection of the tangent-space weight vectors for manifold VAE with hidden > 2.",
+    intuition: "<strong>This is a Euclidean projection of tangent vectors.</strong> Remember that the manifold's curvature will distort the actual latent geometry non-linearly."
+  },
+
+  // ── Graph plots ──
+  graph_W: {
+    title: "Feature Graph — W",
+    theory: "A <strong>node-link diagram</strong> where each node is an active feature and edges connect features with high absolute dot product <code>|wᵢᵀwⱼ|</code>. Node color = weight norm, edge intensity = interference strength. Layout uses spring forces (features with higher interference are pulled closer).",
+    intuition: "<strong>Clusters of densely connected nodes</strong> indicate feature groups that are encoded in similar directions and strongly interfere with each other. <strong>Isolated nodes</strong> are cleanly represented features with little interference. The graph topology reveals the <strong>interference structure</strong> at a glance — a densely connected graph means heavy superposition."
+  },
+  graph_W_mu: {
+    title: "Feature Graph — W_μ",
+    theory: "Same as W graph but for the mean encoder. Edges represent interference in the mean encoding only.",
+    intuition: "<strong>Compare with W graph:</strong> The VAE's KL regularization may change the interference topology — features that interfere in a standard model might be separated by the variational objective."
+  },
+  graph_W_logvar: {
+    title: "Feature Graph — W_logvar",
+    theory: "Graph of variance encoder interference patterns.",
+    intuition: "<strong>Features connected here share noise directions.</strong> This reveals which features the model treats as having correlated uncertainty."
+  },
+  graph_W_tangent: {
+    title: "Feature Graph — W_tangent",
+    theory: "Feature interference graph for the tangent-space encoder.",
+    intuition: "<strong>Tangent-space interference ≠ manifold interference.</strong> Use alongside the geodesic distance matrix for accurate manifold geometry."
+  },
+
+  // ── Coordinate Graphs ──
+  coord_graph_W: {
+    title: "Coordinate Graph — W",
+    theory: "Like the feature graph, but node positions are the <strong>actual weight vector coordinates</strong> (or PCA projections for hidden>2). This shows the true geometric relationship between features in weight space, with edges showing interference.",
+    intuition: "<strong>The most geometrically faithful view:</strong> Nearby nodes truly have similar encoding directions. Clusters reveal superposition groups directly. The unit circle shows the natural scale — features inside it are sub-unit-norm, features outside are amplified."
+  },
+  coord_graph_W_mu: {
+    title: "Coordinate Graph — W_μ",
+    theory: "Coordinate graph using actual W_μ vector positions.",
+    intuition: "<strong>Shows where features actually sit in the mean latent space.</strong> Compare with z samples to verify that the encoding is being used as intended."
+  },
+  coord_graph_W_logvar: {
+    title: "Coordinate Graph — W_logvar",
+    theory: "Coordinate graph using W_logvar positions.",
+    intuition: "<strong>Shows the geometry of the noise structure.</strong> Features that cluster here will have correlated posterior noise."
+  },
+  coord_graph_W_tangent: {
+    title: "Coordinate Graph — W_tangent",
+    theory: "Coordinate graph using tangent-space weight positions.",
+    intuition: "<strong>Shows tangent-space geometry.</strong> Remember to mentally apply the exponential map when reasoning about the actual manifold positions."
+  },
+
+  // ── Manifold-specific ──
+  manifold_disk_scatter: {
+    title: "Manifold Disk — z Samples",
+    theory: "Scatter plot of reparameterized z samples on the <strong>Poincaré disk</strong> (or stereographic sphere). The disk boundary represents geodesic infinity — distances grow exponentially near the edge. Concentric dashed circles show constant geodesic distances from the origin.",
+    intuition: "<strong>Key insight:</strong> Points near the center are in a nearly-Euclidean region. Points near the boundary are in a <strong>high-curvature region</strong> with exponentially growing distances — ideal for encoding hierarchical structure. If all z samples cluster near the center, the model isn't using the manifold's curvature advantage."
+  },
+  geodesic_matrix: {
+    title: "Geodesic Distance Matrix",
+    theory: "Pairwise <strong>geodesic distances</strong> (not Euclidean!) between z samples. On the Poincaré disk, the geodesic metric is <code>d(x,y) = (2/√c) · arctanh(√c · ‖-x ⊕ y‖)</code>. This shows the true manifold-aware distances.",
+    intuition: "<strong>Look for block structure</strong> — groups of samples that are geodesically close form clusters. The color scale matters: dark = close, bright = far. Compare with the Euclidean z scatter — pairs that look close in Euclidean space near the boundary may actually be very far in geodesic distance."
+  },
+  curvature_heatmap: {
+    title: "Conformal Factor λ(x) Heatmap",
+    theory: "Visualizes the <strong>conformal factor</strong> λ(x) = 2/(1 - c·‖x‖²) across the latent space, with z samples overlaid. The conformal factor measures how much the Riemannian metric stretches/compresses distances relative to Euclidean space at each point.",
+    intuition: "<strong>Bright regions</strong> (high λ) have enormous metric stretching — small Euclidean moves correspond to large geodesic distances. This is where the manifold provides the most <strong>representational capacity per unit of Euclidean space</strong>. If z samples concentrate in high-λ regions, the model is exploiting curvature for efficient encoding."
+  },
+
+  // ── Jacobian ──
+  manifold_jacobian_W: {
+    title: "Decoder Jacobian — W",
+    theory: "The <strong>mean Jacobian</strong> J = ∂x̂/∂z of the decoder, averaged over a batch of latent samples. Since the decoder is ReLU(z·W+b), the Jacobian is J = diag(mask)·Wᵀ where mask is the ReLU activation pattern. <strong>Singular values</strong> of J reveal the decoder's magnification per latent direction.",
+    intuition: "<strong>Left panel (heatmap):</strong> Shows how each feature responds to each latent direction. Rows with all near-zero values = features that are never activated (dead). <strong>Right panel (singular values):</strong> If σ₁ ≫ σ₂, the decoder compresses one direction — a sign of <strong>anisotropic representation</strong>. Equal singular values = isotropic decoding."
+  },
+  manifold_jacobian_W_mu: {
+    title: "Decoder Jacobian — W_μ",
+    theory: "Jacobian analysis using the mean encoder weights. Identical theory to W Jacobian since the VAE decoder uses W_μ.",
+    intuition: "<strong>Track singular value evolution</strong> (right panel, if time-lapse enabled) to see how the decoder's magnification changes during training. Convergence of singular values suggests the model has found a stable representation."
+  },
+  manifold_jacobian_W_tangent: {
+    title: "Decoder Jacobian — W_tangent",
+    theory: "Jacobian for the manifold VAE decoder, using the tangent-space weights.",
+    intuition: "<strong>Note:</strong> This is the tangent-space Jacobian. The full manifold Jacobian also includes the log map's derivative, which amplifies sensitivities near the boundary."
+  },
+
+  // ── Geometry ──
+  manifold_geometry_W: {
+    title: "Geometry — Metric Tensor & Hessian",
+    theory: "<strong>G = JᵀJ</strong> is the <strong>metric tensor</strong> (pull-back of the feature-space Euclidean metric). It measures local distances in latent space. <strong>H = 2W·diag(imp⊙mask)·Wᵀ</strong> is the loss <strong>Hessian</strong> w.r.t. z, measuring curvature of the loss landscape.",
+    intuition: "<strong>G (top row):</strong> Diagonal = magnification per hidden dim. Off-diagonal = coupling between dims. Equal eigenvalues = isotropic metric (distances are preserved). <strong>H (bottom row):</strong> All positive eigenvalues → local minimum. Mixed signs → saddle point. Large eigenvalues → sharp curvature (sensitive to small z perturbations)."
+  },
+  manifold_geometry_W_mu: {
+    title: "Geometry — W_μ Metric & Hessian",
+    theory: "Same geometry analysis but using the VAE's mean encoder weights.",
+    intuition: "<strong>Same interpretation.</strong> Compare G eigenvalue ratios across model types to see if the VAE's regularization produces more isotropic metrics."
+  },
+  manifold_geometry_W_tangent: {
+    title: "Geometry — W_tangent Metric & Hessian",
+    theory: "Geometry analysis for the manifold VAE's tangent-space encoder.",
+    intuition: "<strong>The metric tensor here describes tangent-space geometry.</strong> For the full Riemannian picture, multiply by the conformal factor squared."
+  },
+
+  // ── Manifold Summary ──
+  manifold_summary_W: {
+    title: "Manifold Summary — W",
+    theory: "Dashboard of key manifold diagnostics: <strong>condition number</strong> (ratio of max/min Jacobian singular values), <strong>effective rank</strong> (entropy of normalized singular values), <strong>det(G)</strong> (volume element / area magnification), and <strong>Hessian analysis</strong>.",
+    intuition: "<strong>Condition number:</strong> < 10 = well-conditioned, > 100 = ill-conditioned (some directions are compressed vs. stretched). <strong>Effective rank:</strong> close to hidden dim = all directions used equally. Close to 1 = model only uses one direction. <strong>det(G):</strong> local area magnification. Near zero = the mapping collapses volume (degenerate). <strong>Active fraction:</strong> % of ReLU neurons active on average."
+  },
+  manifold_summary_W_mu: {
+    title: "Manifold Summary — W_μ",
+    theory: "Same manifold summary for the VAE mean encoder.",
+    intuition: "<strong>Compare with standard model summary</strong> to quantify the effect of variational regularization on the representation geometry."
+  },
+  manifold_summary_W_tangent: {
+    title: "Manifold Summary — W_tangent",
+    theory: "Manifold summary for the tangent-space encoder.",
+    intuition: "<strong>In manifold VAEs, the condition number reflects tangent-space conditioning.</strong> The actual manifold geometry also depends on curvature — a well-conditioned tangent map can still produce poor manifold representations at high curvature."
+  },
+};
+
+// ── State for explanation panel ──
+let explanationCollapsed = false;
+
+function renderExplanationPanel(plotType) {
+  const container = $("#plot-explanation-container");
+  if (!container) return;
+
+  // No explanation for raw_weights (it has its own UI)
+  if (plotType === "raw_weights" || !PLOT_EXPLANATIONS[plotType]) {
+    container.innerHTML = "";
+    return;
+  }
+
+  const ex = PLOT_EXPLANATIONS[plotType];
+  const bodyClass = explanationCollapsed ? "collapsed" : "";
+  const toggleText = explanationCollapsed ? "▸ Show" : "▾ Hide";
+
+  container.innerHTML = `
+    <div class="plot-explanation" id="plot-explanation">
+      <div class="plot-explanation__header" onclick="toggleExplanation()">
+        <div class="plot-explanation__title">
+          <span>📖</span> ${ex.title}
+        </div>
+        <button class="plot-explanation__toggle" id="explanation-toggle">${toggleText}</button>
+      </div>
+      <div class="plot-explanation__body ${bodyClass}" id="explanation-body">
+        <div class="plot-explanation__section">
+          <div class="plot-explanation__section-label theory">🔬 Theory</div>
+          <div class="plot-explanation__text">${ex.theory}</div>
+        </div>
+        <div class="plot-explanation__section">
+          <div class="plot-explanation__section-label intuition">💡 Intuition — How to Read</div>
+          <div class="plot-explanation__text">${ex.intuition}</div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function toggleExplanation() {
+  explanationCollapsed = !explanationCollapsed;
+  const body = $("#explanation-body");
+  const toggle = $("#explanation-toggle");
+  if (body) {
+    body.classList.toggle("collapsed", explanationCollapsed);
+  }
+  if (toggle) {
+    toggle.textContent = explanationCollapsed ? "▸ Show" : "▾ Hide";
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Raw Weight Vector Viewer
+// ═══════════════════════════════════════════════════════════════
+let weightViewerActiveMatrix = null;
+let weightViewerData = null;
+
+async function loadWeightViewer() {
+  const canvas = $("#plot-canvas");
+  if (!canvas) return;
+
+  // Show loading
+  showLoading("Loading weight data...");
+  renderExplanationPanel("raw_weights");
+
+  try {
+    const resp = await fetch(`${API_BASE}/api/weights`);
+    const data = await resp.json();
+
+    if (!data.success) {
+      showToast(data.error || "Failed to load weights", "error");
+      hideLoading();
+      return;
+    }
+
+    weightViewerData = data;
+    const matrixKeys = Object.keys(data.matrices);
+    if (matrixKeys.length === 0) {
+      showToast("No weight matrices available", "warning");
+      hideLoading();
+      return;
+    }
+
+    // Default to first matrix
+    if (!weightViewerActiveMatrix || !data.matrices[weightViewerActiveMatrix]) {
+      weightViewerActiveMatrix = matrixKeys[0];
+    }
+
+    renderWeightViewer(data, weightViewerActiveMatrix);
+    hideLoading();
+
+  } catch (err) {
+    showToast(`Error: ${err.message}`, "error");
+    console.error(err);
+    hideLoading();
+  }
+}
+
+function renderWeightViewer(data, activeKey) {
+  const canvas = $("#plot-canvas");
+  if (!canvas) return;
+
+  // Remove existing content
+  const oldImg = canvas.querySelector("img");
+  if (oldImg) oldImg.remove();
+  const emptyState = canvas.querySelector(".plot-canvas__empty");
+  if (emptyState) emptyState.remove();
+  const oldViewer = canvas.querySelector(".weight-viewer");
+  if (oldViewer) oldViewer.remove();
+
+  const mat = data.matrices[activeKey];
+  if (!mat) return;
+
+  const matrixKeys = Object.keys(data.matrices);
+
+  // Build matrix tabs
+  let tabsHtml = "";
+  matrixKeys.forEach(key => {
+    const info = data.matrices[key];
+    const cls = key === activeKey ? "active" : "";
+    tabsHtml += `<button class="weight-viewer__matrix-tab ${cls}" onclick="switchWeightMatrix('${key}')">${info.name}</button>`;
+  });
+
+  // Find global max absolute value for color scaling
+  const allValues = mat.values.flat();
+  const absMax = Math.max(...allValues.map(Math.abs), 1e-8);
+
+  // Build table HTML
+  const [hidden, nFeatures] = mat.shape;
+  const headerCells = [`<th class="row-header"></th>`];
+  for (let j = 0; j < nFeatures; j++) {
+    headerCells.push(`<th>f${j}</th>`);
+  }
+
+  let rowsHtml = "";
+  for (let i = 0; i < hidden; i++) {
+    let cells = `<td class="row-label">h${i}</td>`;
+    for (let j = 0; j < nFeatures; j++) {
+      const v = mat.values[i][j];
+      const color = weightCellColor(v, absMax);
+      const formatted = formatWeightValue(v);
+      cells += `<td class="weight-cell" style="background:${color}" title="h${i}, f${j}: ${v.toFixed(8)}">${formatted}</td>`;
+    }
+    rowsHtml += `<tr>${cells}</tr>`;
+  }
+
+  // Norms row
+  let normCells = `<td class="row-label">‖wᵢ‖</td>`;
+  const normMax = mat.max_norm || 1;
+  for (let j = 0; j < nFeatures; j++) {
+    const n = mat.norms[j];
+    const intensity = Math.min(n / normMax, 1);
+    const r = Math.round(139 + intensity * 80);
+    const g = Math.round(92 - intensity * 40);
+    const b = Math.round(246);
+    const bg = `rgba(${r}, ${g}, ${b}, ${(0.08 + intensity * 0.25).toFixed(2)})`;
+    normCells += `<td class="weight-cell" style="background:${bg}" title="‖w_${j}‖ = ${n.toFixed(6)}">${n.toFixed(4)}</td>`;
+  }
+  rowsHtml += `<tr class="norm-row">${normCells}</tr>`;
+
+  const viewer = document.createElement("div");
+  viewer.className = "weight-viewer";
+  viewer.innerHTML = `
+    <div class="weight-viewer__header">
+      <div class="weight-viewer__title">📊 Raw Weight Vectors</div>
+      <div class="weight-viewer__matrix-tabs">${tabsHtml}</div>
+    </div>
+    <div class="weight-viewer__info">
+      <div class="weight-viewer__info-item">
+        Shape: <span class="weight-viewer__info-value">${hidden} × ${nFeatures}</span>
+      </div>
+      <div class="weight-viewer__info-item">
+        Max Norm: <span class="weight-viewer__info-value">${mat.max_norm.toFixed(4)}</span>
+      </div>
+      <div class="weight-viewer__info-item">
+        Mean Norm: <span class="weight-viewer__info-value">${mat.mean_norm.toFixed(4)}</span>
+      </div>
+      <div class="weight-viewer__legend">
+        <span>−${absMax.toFixed(2)}</span>
+        <div class="weight-viewer__legend-bar"></div>
+        <span>+${absMax.toFixed(2)}</span>
+      </div>
+    </div>
+    <div class="weight-table-container">
+      <table class="weight-table">
+        <thead><tr>${headerCells.join("")}</tr></thead>
+        <tbody>${rowsHtml}</tbody>
+      </table>
+    </div>
+  `;
+
+  canvas.insertBefore(viewer, canvas.firstChild);
+}
+
+function switchWeightMatrix(key) {
+  weightViewerActiveMatrix = key;
+  if (weightViewerData) {
+    renderWeightViewer(weightViewerData, key);
+  }
+}
+
+function weightCellColor(value, absMax) {
+  const t = value / absMax; // [-1, 1]
+  if (t > 0) {
+    // Red tones
+    const intensity = Math.min(t, 1);
+    return `rgba(239, 68, 68, ${(intensity * 0.5).toFixed(3)})`;
+  } else if (t < 0) {
+    // Blue tones
+    const intensity = Math.min(-t, 1);
+    return `rgba(59, 130, 246, ${(intensity * 0.5).toFixed(3)})`;
+  }
+  return "transparent";
+}
+
+function formatWeightValue(v) {
+  if (Math.abs(v) < 0.0001) return v.toExponential(1);
+  if (Math.abs(v) < 1) return v.toFixed(4);
+  return v.toFixed(3);
+}
 
 function setupPlotTabs() {
   // Placeholder — tabs are rendered dynamically after training
@@ -421,16 +944,39 @@ function renderPlotTabs(plots) {
     tab.dataset.plot = plotType;
     tab.id = `tab-${plotType}`;
     tab.addEventListener("click", () => {
-      $$(".plot-tab").forEach((t) => t.classList.remove("active"));
+      $$("#plot-tabs .plot-tab").forEach((t) => t.classList.remove("active"));
       tab.classList.add("active");
       loadPlot(plotType);
     });
     container.appendChild(tab);
   });
+
+  // Append the "Raw Weights" pseudo-tab
+  const rawTab = document.createElement("button");
+  rawTab.className = "plot-tab";
+  rawTab.textContent = "📊 Raw Weights";
+  rawTab.dataset.plot = "raw_weights";
+  rawTab.id = "tab-raw_weights";
+  rawTab.style.borderColor = "var(--accent-3)";
+  rawTab.addEventListener("click", () => {
+    $$("#plot-tabs .plot-tab").forEach((t) => t.classList.remove("active"));
+    rawTab.classList.add("active");
+    loadPlot("raw_weights");
+  });
+  container.appendChild(rawTab);
 }
 
 async function loadPlot(plotType) {
   state.currentPlot = plotType;
+
+  // Handle raw weights specially
+  if (plotType === "raw_weights") {
+    loadWeightViewer();
+    return;
+  }
+
+  // Show explanation panel
+  renderExplanationPanel(plotType);
 
   // Check cache
   if (state.plotCache[plotType]) {
@@ -471,6 +1017,10 @@ async function loadPlot(plotType) {
 function renderPlotImage(base64, plotType) {
   const canvas = $("#plot-canvas");
   if (!canvas) return;
+
+  // Remove any weight viewer if present
+  const oldViewer = canvas.querySelector(".weight-viewer");
+  if (oldViewer) oldViewer.remove();
 
   const img = new Image();
   img.src = `data:image/png;base64,${base64}`;
@@ -1417,52 +1967,51 @@ function openLightbox(imageSrc, caption) {
 }
 
 function initModeTabs() {
-  const tabSingle = $("#tab-mode-single");
-  const tabSweep = $("#tab-mode-sweep");
   const workspaceSingle = $("#workspace-single");
   const workspaceSweep = $("#workspace-sweep");
+  const workspaceGeometry = $("#workspace-geometry");
+  const workspaceOrthogonality = $("#workspace-orthogonality");
   const cardSweep = $("#card-sweep");
   const cardData = document.querySelectorAll(".card")[2];
   const btnTrain = $("#btn-train");
+  const navigation = [...document.querySelectorAll(".unified-nav__item")];
 
-  if (tabSingle && tabSweep) {
-    tabSingle.addEventListener("click", () => {
-      tabSingle.classList.add("active");
-      tabSweep.classList.remove("active");
-      workspaceSingle.classList.remove("hidden");
-      workspaceSweep.classList.add("hidden");
-      
+  function activateWorkspace(workspace, geometryView = null) {
+    navigation.forEach(item => {const active=item.dataset.workspace === workspace && (workspace !== "geometry" || item.dataset.geometryView === geometryView);item.classList.toggle("active",active);if(active)item.setAttribute("aria-current","page");else item.removeAttribute("aria-current");});
+    [workspaceSingle, workspaceSweep, workspaceGeometry, workspaceOrthogonality].forEach(panel=>panel?.classList.add("hidden"));
+    document.body.classList.remove("geometry-mode", "orthogonality-mode");
+
+    if (workspace === "geometry") {
+      workspaceGeometry?.classList.remove("hidden");
+      document.body.classList.add("geometry-mode");
+      state.sweepMode = "geometry";
+      window._pendingGeometryView = geometryView || "data";
+      window.geometryLabSetView?.(window._pendingGeometryView);
+      const badge=$(".mode-badge");if(badge)badge.textContent="LAB";
+    } else if (workspace === "single") {
+      workspaceSingle?.classList.remove("hidden");
       cardSweep?.classList.add("hidden");
-      if (cardData) {
-        cardData.style.opacity = "1";
-        cardData.style.pointerEvents = "auto";
-      }
-      
-      if (btnTrain) {
-        btnTrain.innerHTML = "▶ Train Model";
-      }
-      state.sweepMode = "single";
-    });
-
-    tabSweep.addEventListener("click", () => {
-      tabSingle.classList.remove("active");
-      tabSweep.classList.add("active");
-      workspaceSingle.classList.add("hidden");
-      workspaceSweep.classList.remove("hidden");
-      
+      if(cardData){cardData.style.opacity="1";cardData.style.pointerEvents="auto";}
+      if(btnTrain)btnTrain.innerHTML="▶ Train Model";
+      state.sweepMode="single";updateModeBadge();
+    } else if (workspace === "sweep") {
+      workspaceSweep?.classList.remove("hidden");
       cardSweep?.classList.remove("hidden");
-      if (cardData) {
-        cardData.style.opacity = "0.25";
-        cardData.style.pointerEvents = "none";
-      }
-      
-      if (btnTrain) {
-        btnTrain.innerHTML = "▶ Run Sweep Analysis";
-      }
-      state.sweepMode = "sweep";
-      updateSweepPlotOptions();
-    });
+      if(cardData){cardData.style.opacity="0.25";cardData.style.pointerEvents="none";}
+      if(btnTrain)btnTrain.innerHTML="▶ Run Sweep Analysis";
+      state.sweepMode="sweep";const badge=$(".mode-badge");if(badge)badge.textContent="SWEEP";updateSweepPlotOptions();
+    } else if (workspace === "orthogonality") {
+      workspaceOrthogonality?.classList.remove("hidden");
+      document.body.classList.add("orthogonality-mode");
+      state.sweepMode="orthogonality";const badge=$(".mode-badge");if(badge)badge.textContent="GRAM";
+    }
+    window.dispatchEvent(new Event("resize"));
   }
+
+  window.activateUnifiedWorkspace=activateWorkspace;
+  navigation.forEach(item=>item.addEventListener("click",()=>activateWorkspace(item.dataset.workspace,item.dataset.geometryView||null)));
+  const initial=navigation.find(item=>item.classList.contains("active"))||navigation[0];
+  if(initial)activateWorkspace(initial.dataset.workspace,initial.dataset.geometryView||null);
 }
 
 function updateSweepPlotOptions() {
@@ -1472,10 +2021,43 @@ function updateSweepPlotOptions() {
   const hidden = parseInt($("#hidden-dim")?.value ?? 2);
   const is2d = (hidden === 2);
   const isVae = (state.modelType === "vae");
+  const isManifold = (state.modelType === "manifold_vae");
 
   let options = [];
 
-  if (isVae) {
+  if (isManifold) {
+    if (is2d) {
+      options = [
+        { value: "manifold_combined", label: "Manifold Combined (Default)" },
+        { value: "arrows_W_tangent", label: "W_tangent Arrows" },
+        { value: "manifold_disk_scatter", label: "Manifold Disk" },
+        { value: "geodesic_matrix", label: "Geodesic Matrix" },
+        { value: "curvature_heatmap", label: "Curvature λ(x)" },
+        { value: "interference_W_tangent", label: "W_tangent Interference" },
+        { value: "norms_W_tangent", label: "W_tangent Norms" },
+        { value: "graph_W_tangent", label: "W_tangent Graph" },
+        { value: "coord_graph_W_tangent", label: "W_tangent Coord Graph" },
+        { value: "manifold_jacobian_W_tangent", label: "W_tangent Jacobian" },
+        { value: "manifold_geometry_W_tangent", label: "W_tangent Geometry" },
+        { value: "manifold_summary_W_tangent", label: "W_tangent Manifold Summary" }
+      ];
+    } else {
+      options = [
+        { value: "pca_W_tangent", label: "W_tangent PCA (Default)" },
+        { value: "manifold_disk_scatter", label: "Manifold Disk" },
+        { value: "geodesic_matrix", label: "Geodesic Matrix" },
+        { value: "curvature_heatmap", label: "Curvature λ(x)" },
+        { value: "heatmap_W_tangent", label: "W_tangent Heatmap" },
+        { value: "interference_W_tangent", label: "W_tangent Interference" },
+        { value: "norms_W_tangent", label: "W_tangent Norms" },
+        { value: "graph_W_tangent", label: "W_tangent Graph" },
+        { value: "coord_graph_W_tangent", label: "W_tangent Coord Graph" },
+        { value: "manifold_jacobian_W_tangent", label: "W_tangent Jacobian" },
+        { value: "manifold_geometry_W_tangent", label: "W_tangent Geometry" },
+        { value: "manifold_summary_W_tangent", label: "W_tangent Manifold Summary" }
+      ];
+    }
+  } else if (isVae) {
     if (is2d) {
       options = [
         { value: "combined", label: "Combined Overlay (Default)" },
@@ -1487,7 +2069,12 @@ function updateSweepPlotOptions() {
         { value: "norms_W_mu", label: "W_μ Norms" },
         { value: "norms_W_logvar", label: "W_logvar Norms" },
         { value: "graph_W_mu", label: "W_μ Graph" },
-        { value: "graph_W_logvar", label: "W_logvar Graph" }
+        { value: "graph_W_logvar", label: "W_logvar Graph" },
+        { value: "coord_graph_W_mu", label: "W_μ Coord Graph" },
+        { value: "coord_graph_W_logvar", label: "W_logvar Coord Graph" },
+        { value: "manifold_jacobian_W_mu", label: "W_μ Jacobian" },
+        { value: "manifold_geometry_W_mu", label: "W_μ Geometry" },
+        { value: "manifold_summary_W_mu", label: "W_μ Manifold Summary" }
       ];
     } else {
       options = [
@@ -1500,7 +2087,12 @@ function updateSweepPlotOptions() {
         { value: "norms_W_mu", label: "W_μ Norms" },
         { value: "norms_W_logvar", label: "W_logvar Norms" },
         { value: "graph_W_mu", label: "W_μ Graph" },
-        { value: "graph_W_logvar", label: "W_logvar Graph" }
+        { value: "graph_W_logvar", label: "W_logvar Graph" },
+        { value: "coord_graph_W_mu", label: "W_μ Coord Graph" },
+        { value: "coord_graph_W_logvar", label: "W_logvar Coord Graph" },
+        { value: "manifold_jacobian_W_mu", label: "W_μ Jacobian" },
+        { value: "manifold_geometry_W_mu", label: "W_μ Geometry" },
+        { value: "manifold_summary_W_mu", label: "W_μ Manifold Summary" }
       ];
     }
   } else {
@@ -1509,7 +2101,11 @@ function updateSweepPlotOptions() {
         { value: "arrows_W", label: "W Arrows (Default)" },
         { value: "interference_W", label: "W Interference" },
         { value: "norms_W", label: "W Norms" },
-        { value: "graph_W", label: "W Graph" }
+        { value: "graph_W", label: "W Graph" },
+        { value: "coord_graph_W", label: "W Coord Graph" },
+        { value: "manifold_jacobian_W", label: "W Jacobian" },
+        { value: "manifold_geometry_W", label: "W Geometry" },
+        { value: "manifold_summary_W", label: "W Manifold Summary" }
       ];
     } else {
       options = [
@@ -1517,7 +2113,11 @@ function updateSweepPlotOptions() {
         { value: "heatmap_W", label: "W Heatmap" },
         { value: "interference_W", label: "W Interference" },
         { value: "norms_W", label: "W Norms" },
-        { value: "graph_W", label: "W Graph" }
+        { value: "graph_W", label: "W Graph" },
+        { value: "coord_graph_W", label: "W Coord Graph" },
+        { value: "manifold_jacobian_W", label: "W Jacobian" },
+        { value: "manifold_geometry_W", label: "W Geometry" },
+        { value: "manifold_summary_W", label: "W Manifold Summary" }
       ];
     }
   }
@@ -1784,6 +2384,13 @@ const LOSS_PRESETS = {
     { id: "recon_only", label: "Recon Only", expr: "recon" },
     { id: "kl_only", label: "KL Only", expr: "kl" },
     { id: "heavy_kl", label: "Heavy KL (5x)", expr: "recon + 5.0 * beta_t * kl" },
+  ],
+  manifold_vae: [
+    { id: "default", label: "Default (Riemannian KL)", expr: "recon + beta_t * kl" },
+    { id: "riemannian_kl", label: "Riemannian KL Divergence", expr: "recon + beta_t * kl" },
+    { id: "tangent_penalty", label: "Tangent Space Penalty", expr: "tangent_pen" },
+    { id: "geodesic", label: "Geodesic Distance", expr: "geodesic_dist" },
+    { id: "score_matching", label: "Riemannian Score Matching", expr: "score_matching" },
   ]
 };
 
@@ -1805,6 +2412,12 @@ const LOSS_SNIPPETS = {
     { label: "torch.clamp(..., min=0)", code: "torch.clamp(, min=0)", icon: "⌐" },
     { label: "importance * ...", code: "importance * ", icon: "w" },
     { label: ".mean()", code: ".mean()", icon: "μ" },
+  ],
+  manifold_vae: [
+    { label: "recon + β·kl + pen", code: "recon + beta_t * kl + tangent_weight * tangent_pen", icon: "Ⓜ" },
+    { label: "geodesic_dist", code: "geodesic_dist", icon: "G" },
+    { label: "score_matching", code: "score_matching", icon: "S" },
+    { label: "tangent_pen", code: "tangent_pen", icon: "T" },
   ]
 };
 
@@ -1825,6 +2438,22 @@ const LOSS_VARIABLES = {
     { name: "beta_t", kind: "scalar", shape: "float", desc: "Current β (warmed)" },
     { name: "recon", kind: "scalar", shape: "scalar", desc: "Recon loss term" },
     { name: "kl", kind: "scalar", shape: "scalar", desc: "KL divergence" },
+    { name: "torch", kind: "module", shape: "", desc: "PyTorch namespace" }
+  ],
+  manifold_vae: [
+    { name: "x", kind: "tensor", shape: "[B, n]", desc: "Input batch" },
+    { name: "x_hat", kind: "tensor", shape: "[B, n]", desc: "Reconstruction" },
+    { name: "mu", kind: "tensor", shape: "[B, h]", desc: "Encoder mean" },
+    { name: "logvar", kind: "tensor", shape: "[B, h]", desc: "Log variance" },
+    { name: "z", kind: "tensor", shape: "[B, h]", desc: "Latent sample" },
+    { name: "importance", kind: "tensor", shape: "[n]", desc: "Per-feature weight" },
+    { name: "beta_t", kind: "scalar", shape: "float", desc: "Current β (warmed)" },
+    { name: "tangent_weight", kind: "scalar", shape: "float", desc: "Tangent weight" },
+    { name: "recon", kind: "scalar", shape: "scalar", desc: "Recon loss term" },
+    { name: "kl", kind: "scalar", shape: "scalar", desc: "Riemannian KL term" },
+    { name: "tangent_pen", kind: "scalar", shape: "scalar", desc: "Tangent penalty term" },
+    { name: "geodesic_dist", kind: "scalar", shape: "scalar", desc: "Geodesic dist loss" },
+    { name: "score_matching", kind: "scalar", shape: "scalar", desc: "Score matching loss" },
     { name: "torch", kind: "module", shape: "", desc: "PyTorch namespace" }
   ]
 };
