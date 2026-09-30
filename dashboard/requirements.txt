@@ -12,3 +12,5 @@ umap-learn
 ripser
 PyYAML
 h5py
+pypdf
+captum

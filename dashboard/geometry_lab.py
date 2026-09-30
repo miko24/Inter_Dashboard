@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import importlib.util
 import itertools
 import json
 import math
@@ -33,8 +34,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from flask import jsonify, request, send_file
 
+from analysis_extensions import (
+    custom_analysis_ids,
+    register_analysis_extensions,
+    run_custom_analyses,
+)
 from concept_catalog import CONCEPTS
 from metrics_engine import run_scientific_analysis
+from notebook_export import build_experiment_notebook
 from paper_metrics import polarization_snapshot
 from paper_requirements import evaluate_paper_requirements, model_family, paper_reproduction_spec
 from zietlow_reproduction import (
@@ -60,7 +67,7 @@ FACTOR_SPECS = {
 }
 
 MODEL_LABELS = {
-    "autoencoder": "Zietlow convolutional autoencoder",
+    "autoencoder": "Autoencoder",
     "linear_ae": "Linear Autoencoder",
     "nonlinear_ae": "Nonlinear Autoencoder",
     "vae": "Standard VAE",
@@ -78,6 +85,14 @@ MODEL_LABELS = {
     "riemannian_vae": "Geometry-aware / Riemannian VAE",
     "custom_ae": "Custom declarative Autoencoder",
     "custom_vae": "Custom declarative VAE",
+    "cnn_autoencoder": "CNN Autoencoder",
+    "cnn_vae": "CNN Variational Autoencoder",
+    "transformer_autoencoder": "Transformer Autoencoder",
+    "transformer_vae": "Transformer Variational Autoencoder",
+    "rnn_autoencoder": "RNN / GRU / LSTM Autoencoder",
+    "rnn_vae": "RNN / GRU / LSTM Variational Autoencoder",
+    "mamba_autoencoder": "Mamba Autoencoder",
+    "mamba_vae": "Mamba Variational Autoencoder",
 }
 
 DATASET_CATALOG = {
@@ -159,7 +174,10 @@ PAPER_NONLINEAR_DATASET_PROTOCOL = {
 
 def _analysis_plan(value):
     supplied = value if isinstance(value, list) else DEFAULT_ANALYSIS_PLAN
-    return list(dict.fromkeys(str(item) for item in supplied if str(item) in ANALYSIS_IDS))
+    return list(dict.fromkeys(
+        str(item) for item in supplied
+        if str(item) in ANALYSIS_IDS or str(item).startswith("custom:")
+    ))
 
 
 def _utc_now():
@@ -622,6 +640,201 @@ class ConvDecoder(nn.Module):
         return images.flatten(1)
 
 
+def _sequence_shape(input_dim, custom):
+    requested = int(custom.get("sequence_length", 0) or 0)
+    if requested:
+        if requested < 2 or requested > input_dim or input_dim % requested:
+            raise ValueError("sequence_length must be between 2 and input_dim and divide input_dim exactly")
+        return requested, input_dim // requested
+    for length in range(min(32, input_dim), 1, -1):
+        if input_dim % length == 0:
+            return length, input_dim // length
+    return input_dim, 1
+
+
+class TransformerVectorEncoder(nn.Module):
+    def __init__(self, input_dim, output_dim, custom):
+        super().__init__()
+        self.sequence_length, self.feature_dim = _sequence_shape(input_dim, custom)
+        width = int(custom.get("d_model", 128))
+        heads = int(custom.get("num_heads", 4))
+        if width < 4 or width > 2048 or heads < 1 or width % heads:
+            raise ValueError("Transformer d_model must be divisible by num_heads")
+        depth = max(1, min(24, int(custom.get("num_layers", 2))))
+        feedforward = max(width, min(8192, int(custom.get("feedforward_dim", width * 4))))
+        dropout = float(custom.get("dropout", 0.0))
+        self.input_projection = nn.Linear(self.feature_dim, width)
+        self.position = nn.Parameter(torch.zeros(1, self.sequence_length, width))
+        layer = nn.TransformerEncoderLayer(
+            width, heads, feedforward, dropout=dropout, activation="gelu",
+            batch_first=True, norm_first=True,
+        )
+        self.blocks = nn.TransformerEncoder(layer, depth)
+        self.output_projection = nn.Linear(width, output_dim)
+
+    def forward(self, x):
+        tokens = x.reshape(x.shape[0], self.sequence_length, self.feature_dim)
+        hidden = self.blocks(self.input_projection(tokens) + self.position)
+        return self.output_projection(hidden.mean(dim=1))
+
+
+class TransformerVectorDecoder(nn.Module):
+    def __init__(self, latent_dim, output_dim, custom):
+        super().__init__()
+        self.sequence_length, self.feature_dim = _sequence_shape(output_dim, custom)
+        width = int(custom.get("d_model", 128))
+        heads = int(custom.get("num_heads", 4))
+        if width < 4 or width > 2048 or heads < 1 or width % heads:
+            raise ValueError("Transformer d_model must be divisible by num_heads")
+        depth = max(1, min(24, int(custom.get("num_layers", 2))))
+        feedforward = max(width, min(8192, int(custom.get("feedforward_dim", width * 4))))
+        self.seed_projection = nn.Linear(latent_dim, self.sequence_length * width)
+        self.position = nn.Parameter(torch.zeros(1, self.sequence_length, width))
+        layer = nn.TransformerEncoderLayer(
+            width, heads, feedforward, dropout=float(custom.get("dropout", 0.0)),
+            activation="gelu", batch_first=True, norm_first=True,
+        )
+        self.blocks = nn.TransformerEncoder(layer, depth)
+        self.output_projection = nn.Linear(width, self.feature_dim)
+
+    def forward(self, z):
+        hidden = self.seed_projection(z).reshape(z.shape[0], self.sequence_length, -1) + self.position
+        return self.output_projection(self.blocks(hidden)).flatten(1)
+
+
+class RecurrentVectorEncoder(nn.Module):
+    def __init__(self, input_dim, output_dim, custom):
+        super().__init__()
+        self.sequence_length, self.feature_dim = _sequence_shape(input_dim, custom)
+        hidden = max(4, min(4096, int(custom.get("rnn_hidden_size", 128))))
+        depth = max(1, min(16, int(custom.get("num_layers", 2))))
+        bidirectional = bool(custom.get("bidirectional", False))
+        kind = str(custom.get("rnn_type", "gru")).lower()
+        recurrent = {"rnn": nn.RNN, "gru": nn.GRU, "lstm": nn.LSTM}.get(kind)
+        if recurrent is None:
+            raise ValueError("rnn_type must be rnn, gru, or lstm")
+        self.bidirectional = bidirectional
+        self.recurrent = recurrent(
+            self.feature_dim, hidden, depth, batch_first=True,
+            dropout=float(custom.get("dropout", 0.0)) if depth > 1 else 0.0,
+            bidirectional=bidirectional,
+        )
+        self.output_projection = nn.Linear(hidden * (2 if bidirectional else 1), output_dim)
+
+    def forward(self, x):
+        tokens = x.reshape(x.shape[0], self.sequence_length, self.feature_dim)
+        output, _ = self.recurrent(tokens)
+        pooled = torch.cat([output[:, -1, :output.shape[-1] // 2], output[:, 0, output.shape[-1] // 2:]], -1) if self.bidirectional else output[:, -1]
+        return self.output_projection(pooled)
+
+
+class RecurrentVectorDecoder(nn.Module):
+    def __init__(self, latent_dim, output_dim, custom):
+        super().__init__()
+        self.sequence_length, self.feature_dim = _sequence_shape(output_dim, custom)
+        hidden = max(4, min(4096, int(custom.get("rnn_hidden_size", 128))))
+        depth = max(1, min(16, int(custom.get("num_layers", 2))))
+        kind = str(custom.get("rnn_type", "gru")).lower()
+        recurrent = {"rnn": nn.RNN, "gru": nn.GRU, "lstm": nn.LSTM}.get(kind)
+        if recurrent is None:
+            raise ValueError("rnn_type must be rnn, gru, or lstm")
+        self.input_projection = nn.Linear(latent_dim, hidden)
+        self.recurrent = recurrent(
+            hidden, hidden, depth, batch_first=True,
+            dropout=float(custom.get("dropout", 0.0)) if depth > 1 else 0.0,
+        )
+        self.output_projection = nn.Linear(hidden, self.feature_dim)
+
+    def forward(self, z):
+        tokens = self.input_projection(z).unsqueeze(1).expand(-1, self.sequence_length, -1)
+        output, _ = self.recurrent(tokens)
+        return self.output_projection(output).flatten(1)
+
+
+class PortableMamba(nn.Module):
+    """Small pure-PyTorch selective SSM for portable local Mamba experiments.
+
+    This preserves the input-dependent state update central to Mamba-style
+    models, but is intentionally recorded as a portable implementation rather
+    than claimed to be source-identical to the optimized mamba-ssm kernels.
+    """
+
+    def __init__(self, d_model, d_state=16, d_conv=4, expand=2):
+        super().__init__()
+        inner = int(d_model) * int(expand)
+        self.inner = inner
+        self.d_state = int(d_state)
+        self.input_projection = nn.Linear(int(d_model), inner * 2)
+        self.convolution = nn.Conv1d(inner, inner, int(d_conv), groups=inner, padding=int(d_conv) - 1)
+        self.delta_projection = nn.Linear(inner, inner)
+        self.b_projection = nn.Linear(inner, self.d_state)
+        self.c_projection = nn.Linear(inner, self.d_state)
+        self.a_log = nn.Parameter(torch.zeros(inner, self.d_state))
+        self.skip = nn.Parameter(torch.ones(inner))
+        self.output_projection = nn.Linear(inner, int(d_model))
+
+    def forward(self, inputs):
+        projected, gate = self.input_projection(inputs).chunk(2, dim=-1)
+        convolved = self.convolution(projected.transpose(1, 2))[..., :inputs.shape[1]].transpose(1, 2)
+        values = F.silu(convolved)
+        state = values.new_zeros((values.shape[0], self.inner, self.d_state))
+        outputs = []
+        transition = -torch.exp(self.a_log)
+        for position in range(values.shape[1]):
+            current = values[:, position]
+            delta = F.softplus(self.delta_projection(current)).clamp_max(10)
+            b_value = self.b_projection(current)
+            c_value = self.c_projection(current)
+            decay = torch.exp(delta.unsqueeze(-1) * transition.unsqueeze(0))
+            state = decay * state + delta.unsqueeze(-1) * current.unsqueeze(-1) * b_value.unsqueeze(1)
+            outputs.append((state * c_value.unsqueeze(1)).sum(-1) + self.skip * current)
+        sequence = torch.stack(outputs, dim=1) * torch.sigmoid(gate)
+        return self.output_projection(sequence)
+
+
+def _mamba_class(preferred_backend=None):
+    if preferred_backend == "portable_pytorch_selective_ssm":
+        return PortableMamba, "portable_pytorch_selective_ssm"
+    try:
+        from mamba_ssm import Mamba
+        return Mamba, "official_mamba_ssm"
+    except Exception as exc:
+        if preferred_backend == "official_mamba_ssm":
+            raise RuntimeError("This checkpoint requires the optional mamba-ssm package") from exc
+        return PortableMamba, "portable_pytorch_selective_ssm"
+
+
+class MambaVectorNetwork(nn.Module):
+    def __init__(self, input_dim, output_dim, custom, decoder=False, backend=None):
+        super().__init__()
+        Mamba, self.backend = _mamba_class(backend)
+        self.sequence_length, self.feature_dim = _sequence_shape(input_dim if not decoder else output_dim, custom)
+        width = max(8, min(2048, int(custom.get("d_model", 128))))
+        depth = max(1, min(24, int(custom.get("num_layers", 2))))
+        self.decoder = decoder
+        self.input_projection = nn.Linear(input_dim if decoder else self.feature_dim, self.sequence_length * width if decoder else width)
+        self.blocks = nn.ModuleList([
+            Mamba(
+                d_model=width,
+                d_state=max(1, min(256, int(custom.get("d_state", 16)))),
+                d_conv=max(2, min(16, int(custom.get("d_conv", 4)))),
+                expand=max(1, min(8, int(custom.get("expand", 2)))),
+            ) for _ in range(depth)
+        ])
+        self.norms = nn.ModuleList([nn.LayerNorm(width) for _ in range(depth)])
+        self.output_projection = nn.Linear(width, self.feature_dim if decoder else output_dim)
+
+    def forward(self, x):
+        if self.decoder:
+            hidden = self.input_projection(x).reshape(x.shape[0], self.sequence_length, -1)
+        else:
+            hidden = self.input_projection(x.reshape(x.shape[0], self.sequence_length, self.feature_dim))
+        for block, norm in zip(self.blocks, self.norms):
+            hidden = norm(hidden + block(hidden))
+        output = self.output_projection(hidden)
+        return output.flatten(1) if self.decoder else output.mean(1)
+
+
 class FactorDiscriminator(nn.Module):
     """FactorVAE density-ratio discriminator from joint/permuted latents."""
 
@@ -665,7 +878,11 @@ class GeometryAutoencoder(nn.Module):
         custom = config.get("custom_model") or {}
         bias = bool(config.get("bias", True))
         linear = self.kind == "linear_ae"
-        variational = self.kind in {"vae", "beta_vae", "beta_vae_full_cov", "conv_beta_vae", "factor_vae", "beta_tcvae", "slow_vae", "hyperspherical_vae", "riemannian_vae", "custom_vae"}
+        variational = self.kind in {
+            "vae", "beta_vae", "beta_vae_full_cov", "conv_beta_vae", "factor_vae",
+            "beta_tcvae", "slow_vae", "hyperspherical_vae", "riemannian_vae", "custom_vae",
+            "cnn_vae", "transformer_vae", "rnn_vae", "mamba_vae",
+        }
         self.variational = variational
         self.full_covariance = self.kind == "beta_vae_full_cov" or (self.kind == "custom_vae" and custom.get("posterior") == "full_covariance")
         covariance_parameters = self.latent_dim * (self.latent_dim + 1) // 2
@@ -674,6 +891,15 @@ class GeometryAutoencoder(nn.Module):
         encoder_activation = str(config.get("encoder_activation", custom.get("encoder_activation", activation)))
         decoder_activation = str(config.get("decoder_activation", custom.get("decoder_activation", activation)))
         architecture = str(custom.get("architecture", config.get("architecture", "auto"))).lower()
+        family_architecture = {
+            "cnn_autoencoder": "convolutional", "cnn_vae": "convolutional",
+            "transformer_autoencoder": "transformer", "transformer_vae": "transformer",
+            "rnn_autoencoder": "rnn", "rnn_vae": "rnn",
+            "mamba_autoencoder": "mamba", "mamba_vae": "mamba",
+        }.get(self.kind)
+        if family_architecture:
+            architecture = family_architecture
+        self.architecture = architecture
         if architecture == "convolutional" or self.kind == "conv_beta_vae" or bool(config.get("paper_image_model", False)):
             image_shape = config.get("image_shape") or custom.get("image_shape")
             channels = (custom.get("conv_encoder_channels") or custom.get("conv_channels")
@@ -698,6 +924,17 @@ class GeometryAutoencoder(nn.Module):
                 paddings=custom.get("conv_decoder_paddings") or config.get("conv_decoder_paddings"),
                 dense_layers=custom.get("conv_decoder_dense_layers") or config.get("conv_decoder_dense_layers"),
             )
+        elif architecture == "transformer":
+            self.encoder = TransformerVectorEncoder(input_dim, encoder_output, custom)
+            self.decoder = TransformerVectorDecoder(self.latent_dim, input_dim, custom)
+        elif architecture == "rnn":
+            self.encoder = RecurrentVectorEncoder(input_dim, encoder_output, custom)
+            self.decoder = RecurrentVectorDecoder(self.latent_dim, input_dim, custom)
+        elif architecture == "mamba":
+            backend = config.get("architecture_backend")
+            self.encoder = MambaVectorNetwork(input_dim, encoder_output, custom, decoder=False, backend=backend)
+            self.decoder = MambaVectorNetwork(self.latent_dim, input_dim, custom, decoder=True, backend=backend)
+            self.architecture_backend = self.encoder.backend
         else:
             self.encoder = MLP(input_dim, encoder_output, hidden, enc_depth, encoder_activation, linear,
                                hidden_layers=custom.get("encoder_layers"), bias=bias, **common)
@@ -878,6 +1115,26 @@ def _make_optimizer(parameters, config):
     return torch.optim.Adagrad(parameters, eps=config["optimizer_epsilon"], **common)
 
 
+def _resolve_training_device(config):
+    requested = str(config.get("device", "auto")).lower()
+    cuda_available = torch.cuda.is_available()
+    if requested == "cuda" and not cuda_available:
+        raise RuntimeError(
+            "CUDA was requested but this PyTorch runtime cannot access the GPU. "
+            "Use the dashboard Compute Runtime installer, restart the server, or select CPU."
+        )
+    device = torch.device("cuda:0" if requested == "cuda" or (requested == "auto" and cuda_available) else "cpu")
+    metadata = {
+        "requested_device": requested,
+        "effective_device": str(device),
+        "cuda_available": cuda_available,
+        "torch_cuda_build": torch.version.cuda,
+        "gpu_name": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
+        "gpu_compute_capability": ".".join(map(str, torch.cuda.get_device_capability(device))) if device.type == "cuda" else None,
+    }
+    return device, metadata
+
+
 def _normalized_training_config(raw):
     kind = str(raw.get("model_type", "beta_vae"))
     if kind not in MODEL_LABELS:
@@ -901,13 +1158,25 @@ def _normalized_training_config(raw):
                 raise ValueError(f"{key} must be a non-empty list with at most 12 non-negative integers")
             custom[key] = [max(0, min(128, int(value))) for value in custom[key]]
     architecture = str(custom.get("architecture", raw.get("architecture", "auto"))).lower()
-    if architecture not in {"auto", "mlp", "convolutional"}:
-        raise ValueError("architecture must be auto, mlp, or convolutional")
+    if architecture not in {"auto", "mlp", "convolutional", "transformer", "rnn", "mamba"}:
+        raise ValueError("architecture must be auto, mlp, convolutional, transformer, rnn, or mamba")
     custom["architecture"] = architecture
     custom["dropout"] = max(0.0, min(0.9, float(custom.get("dropout", 0.0))))
     custom["layer_norm"] = bool(custom.get("layer_norm", False))
     if custom.get("posterior", "diagonal") not in {"diagonal", "full_covariance"}:
         raise ValueError("Custom posterior must be diagonal or full_covariance")
+    for key, default, minimum, maximum in (
+        ("sequence_length", 0, 0, 65536), ("d_model", 128, 4, 2048),
+        ("num_heads", 4, 1, 64), ("num_layers", 2, 1, 24),
+        ("feedforward_dim", 512, 4, 8192), ("rnn_hidden_size", 128, 4, 4096),
+        ("d_state", 16, 1, 256), ("d_conv", 4, 2, 16), ("expand", 2, 1, 8),
+    ):
+        if key in custom:
+            custom[key] = max(minimum, min(maximum, int(custom.get(key, default))))
+    custom["rnn_type"] = str(custom.get("rnn_type", "gru")).lower()
+    if custom["rnn_type"] not in {"rnn", "gru", "lstm"}:
+        raise ValueError("rnn_type must be rnn, gru, or lstm")
+    custom["bidirectional"] = bool(custom.get("bidirectional", False))
     allowed_activations = {"relu", "gelu", "tanh", "silu"}
     activation = str(custom.get("activation", raw.get("activation", "gelu"))).lower()
     encoder_activation = str(custom.get("encoder_activation", raw.get("encoder_activation", activation))).lower()
@@ -937,6 +1206,9 @@ def _normalized_training_config(raw):
     metric_sampling = str(raw.get("metric_sampling", "heldout")).lower()
     if metric_sampling not in {"heldout", "reference"}:
         raise ValueError("metric_sampling must be heldout or reference")
+    requested_device = str(raw.get("device", "auto")).lower()
+    if requested_device not in {"auto", "cpu", "cuda"}:
+        raise ValueError("device must be auto, cpu, or cuda")
     return {
         "model_type": kind,
         "epochs": max(1, min(2000, int(raw.get("epochs", 40)))),
@@ -984,6 +1256,7 @@ def _normalized_training_config(raw):
         "pair_weight": max(0.0, min(1000.0, float(raw.get("pair_weight", 1.0)))),
         "paper_hyperparameter_scale": max(0.01, min(100.0, float(raw.get("paper_hyperparameter_scale", 1.0)))),
         "custom_model": custom,
+        "device": requested_device,
         "seed": int(raw.get("seed", 42)),
         "seed_source": "effective_training_configuration",
         "paper_reproduction": paper_reproduction,
@@ -1243,6 +1516,20 @@ def register_geometry_lab(app, experiments_dir):
         loaded = np.load(path, allow_pickle=False)
         return {key: loaded[key] for key in loaded.files}
 
+    def load_trained_model(exp_id):
+        directory = exp_dir(exp_id)
+        checkpoint_path = directory / "model.pt"
+        if not checkpoint_path.exists():
+            raise FileNotFoundError("Train the experiment before opening the ablation lab")
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        training = checkpoint["training_config"]
+        model = GeometryAutoencoder(int(checkpoint["input_dim"]), training)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        model.eval()
+        return model, training
+
+    register_analysis_extensions(app, root, exp_dir, load_trained_model, load_data)
+
     def save_empirical_experiment(name, dataset_source, observations, factors, factor_names,
                                   seed=42, image_shape=None, source_filename="", metadata=None,
                                   factor_metric_types=None):
@@ -1311,11 +1598,27 @@ def register_geometry_lab(app, experiments_dir):
         return jsonify({
             "success": True, "factor_types": FACTOR_SPECS, "models": MODEL_LABELS,
             "datasets": DATASET_CATALOG, "concepts": CONCEPTS,
+            "architecture_families": {
+                "mlp": {"available": True, "variations": ["autoencoder", "vae", "beta_vae", "sparse_ae"]},
+                "convolutional": {"available": True, "variations": ["cnn_autoencoder", "cnn_vae", "conv_beta_vae"]},
+                "transformer": {"available": True, "variations": ["transformer_autoencoder", "transformer_vae"]},
+                "rnn": {"available": True, "variations": ["rnn_autoencoder", "rnn_vae"], "cells": ["rnn", "gru", "lstm"]},
+                "mamba": {
+                    "available": True,
+                    "native_available": importlib.util.find_spec("mamba_ssm") is not None,
+                    "backend": "official_mamba_ssm" if importlib.util.find_spec("mamba_ssm") is not None else "portable_pytorch_selective_ssm",
+                    "variations": ["mamba_autoencoder", "mamba_vae"], "optional_package": "mamba-ssm",
+                },
+            },
+            "custom_analysis_ids": sorted(custom_analysis_ids(root)),
             "custom_model_schema": {
                 "architecture": "mlp", "encoder_layers": [256, 128], "decoder_layers": [128, 256],
                 "activation": "gelu", "encoder_activation": "gelu", "decoder_activation": "gelu",
                 "dropout": 0.0, "layer_norm": False, "bias": True,
                 "posterior": "diagonal",
+                "transformer_example": {"architecture": "transformer", "sequence_length": 16, "d_model": 128, "num_heads": 4, "num_layers": 2, "feedforward_dim": 512},
+                "recurrent_example": {"architecture": "rnn", "sequence_length": 16, "rnn_type": "gru", "rnn_hidden_size": 128, "num_layers": 2, "bidirectional": False},
+                "mamba_example": {"architecture": "mamba", "sequence_length": 16, "d_model": 128, "num_layers": 2, "d_state": 16, "d_conv": 4, "expand": 2},
                 "convolutional_example": {
                     "conv_encoder_channels": [32, 32, 64, 64],
                     "conv_encoder_kernel_sizes": [4, 4, 2, 2],
@@ -1987,6 +2290,11 @@ def register_geometry_lab(app, experiments_dir):
         scientific = read_json("scientific_metrics.json", {})
         paper = read_json("paper_metrics.json", {})
         zietlow = read_json("zietlow_metrics.json", {})
+        custom_analyses = read_json("custom_analysis_results.json", {})
+        ablations = [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in sorted(directory.glob("ablation_*.json"))
+        ]
         environment = read_json("environment.json", {})
         report_training = dict(training)
         report_training.setdefault("bias", True)
@@ -2185,13 +2493,24 @@ def register_geometry_lab(app, experiments_dir):
             ("Mean condition number", "mean_condition_number"),
         ]
         lines.extend(f"| {label} | {value(scientific_summary.get(key))} |" for label, key in auxiliary_fields)
+        if custom_analyses.get("analyses"):
+            lines.extend(["", "## Custom analyses", "", "```json", json.dumps(custom_analyses, indent=2), "```"])
+        if ablations:
+            lines.extend(["", "## Neuron and feature ablations", "", "| Target | Units | Intervention | Relative ΔMSE | Latent shift |", "|---|---|---|---:|---:|"])
+            for item in ablations:
+                metrics = item.get("metrics", {})
+                lines.append(
+                    f"| {item.get('target', {}).get('name', 'unknown')} | {', '.join(map(str, item.get('indices', [])))} "
+                    f"| {item.get('mode', '')} | {value(metrics.get('relative_mse_delta'))} | {value(metrics.get('mean_latent_l2_shift'))} |"
+                )
         lines.extend(["", "## Reproducibility artifacts", "", "| Artifact | Bytes | SHA-256 |", "|---|---:|---|"])
         artifact_names = [
             "config.json", "config.yaml", "dataset.npz", "training_config.json", "environment.json",
             "model.pt", "metrics.json", "analysis.json", "latent.npz", "polarization_trace.json",
             "scientific_metrics.json", "paper_metrics.json", "jacobians.npz",
-            "zietlow_metrics.json", "transformation.json",
+            "custom_analysis_results.json", "zietlow_metrics.json", "transformation.json",
         ]
+        artifact_names.extend(path.name for path in sorted(directory.glob("ablation_*.json")))
         for name in artifact_names:
             path = directory / name
             if path.exists():
@@ -2210,7 +2529,7 @@ def register_geometry_lab(app, experiments_dir):
         return target
 
     BUNDLE_FORMAT = "manifold-superposition-experiment"
-    BUNDLE_SUFFIXES = {".json", ".yaml", ".yml", ".npz", ".pt", ".md", ".txt"}
+    BUNDLE_SUFFIXES = {".json", ".yaml", ".yml", ".npz", ".pt", ".md", ".txt", ".ipynb"}
     BUNDLE_EXCLUDED = {"import_manifest.json"}
 
     def experiment_bundle(exp_id, profile):
@@ -2221,6 +2540,8 @@ def register_geometry_lab(app, experiments_dir):
         directory = exp_dir(exp_id)
         if not (directory / "config.json").exists():
             raise FileNotFoundError("Experiment configuration not found")
+        if profile == "complete" and (directory / "model.pt").is_file():
+            build_experiment_notebook(directory, Path(__file__).resolve().parent)
         candidates = []
         for path in sorted(directory.iterdir(), key=lambda item: item.name):
             if not path.is_file() or path.name in BUNDLE_EXCLUDED or path.suffix.lower() not in BUNDLE_SUFFIXES:
@@ -2240,6 +2561,7 @@ def register_geometry_lab(app, experiments_dir):
             suffix = path.suffix.lower()
             role = ("dataset" if path.name == "dataset.npz" else
                     "checkpoint" if path.name == "model.pt" else
+                    "reproducibility_notebook" if suffix == ".ipynb" else
                     "raw_results" if suffix == ".npz" else
                     "metadata")
             artifacts.append({
@@ -2457,6 +2779,7 @@ def register_geometry_lab(app, experiments_dir):
                 "paper_metrics": "paper_metrics.json", "polarization": "polarization_trace.json",
                 "checkpoint": "model.pt", "training_config": "training_config.json",
                 "environment": "environment.json", "latents": "latent.npz",
+                "custom_analyses": "custom_analysis_results.json",
                 "zietlow_metrics": "zietlow_metrics.json", "transformation": "transformation.json",
             }
             if fmt == "bundle":
@@ -2467,7 +2790,9 @@ def register_geometry_lab(app, experiments_dir):
                     download_name=f"{exp_id}_{profile}_{manifest['content_fingerprint'][:12]}.mslab",
                     mimetype="application/zip",
                 )
-            if fmt == "report":
+            if fmt == "notebook":
+                filename = build_experiment_notebook(directory, Path(__file__).resolve().parent)
+            elif fmt == "report":
                 filename = write_results_report(exp_id)
             elif fmt == "csv":
                 target = directory / "dataset.csv"
@@ -2485,7 +2810,8 @@ def register_geometry_lab(app, experiments_dir):
                 if fmt not in allowed:
                     raise ValueError("Unsupported export format")
                 filename = directory / allowed[fmt]
-            return send_file(filename, as_attachment=True, download_name=f"{exp_id}_{filename.name}")
+            download_name = filename.name if fmt == "notebook" else f"{exp_id}_{filename.name}"
+            return send_file(filename, as_attachment=True, download_name=download_name)
         except Exception as exc:
             return jsonify({"success": False, "error": str(exc)}), 400
 
@@ -2519,6 +2845,10 @@ def register_geometry_lab(app, experiments_dir):
             )}
             torch.manual_seed(config["seed"])
             np.random.seed(config["seed"])
+            device, device_metadata = _resolve_training_device(config)
+            config.update(device_metadata)
+            if device.type == "cuda":
+                torch.cuda.manual_seed_all(config["seed"])
             data = load_data(exp_id)
             observations = torch.from_numpy(data["observations"]).float()
             configured_image_shape = _validated_image_shape(config.get("image_shape"), observations.shape[1])
@@ -2543,7 +2873,8 @@ def register_geometry_lab(app, experiments_dir):
             )
             evaluation_batch_size = max(8, min(config["batch_size"], 1_000_000 // max(1, observations.shape[1])))
             validation_sample = observations[torch.from_numpy(validation_indices[:evaluation_batch_size])]
-            model = GeometryAutoencoder(observations.shape[1], config)
+            model = GeometryAutoencoder(observations.shape[1], config).to(device)
+            config["architecture_backend"] = getattr(model, "architecture_backend", "pytorch_native")
             optimizer = None if config["model_type"] == "random_decoder" else _make_optimizer(model.parameters(), config)
             factor_discriminator = None
             factor_discriminator_optimizer = None
@@ -2552,12 +2883,12 @@ def register_geometry_lab(app, experiments_dir):
             if config["model_type"] == "factor_vae":
                 factor_discriminator = FactorDiscriminator(
                     config["latent_dim"], config["factor_discriminator_width"], config["factor_discriminator_depth"],
-                )
+                ).to(device)
                 factor_discriminator_optimizer = torch.optim.Adam(
                     factor_discriminator.parameters(), lr=config["factor_discriminator_lr"], betas=(.5, .9),
                 )
             if config["model_type"] in {"pcl", "weakly_supervised_gan"}:
-                pair_discriminator = PairDiscriminator(config["latent_dim"])
+                pair_discriminator = PairDiscriminator(config["latent_dim"]).to(device)
                 pair_discriminator_optimizer = torch.optim.Adam(
                     pair_discriminator.parameters(), lr=config["learning_rate"], betas=(.5, .999),
                 )
@@ -2585,7 +2916,7 @@ def register_geometry_lab(app, experiments_dir):
                 model.eval()
                 with torch.no_grad():
                     for start in range(0, len(tensor), evaluation_batch_size):
-                        mu_batch, log_batch = model.encode(tensor[start:start + evaluation_batch_size])
+                        mu_batch, log_batch = model.encode(tensor[start:start + evaluation_batch_size].to(device, non_blocking=True))
                         means.append(mu_batch.cpu().numpy())
                         logs.append(log_batch.cpu().numpy())
                 return np.concatenate(means), np.concatenate(logs)
@@ -2595,6 +2926,7 @@ def register_geometry_lab(app, experiments_dir):
                 sums = np.zeros(4, dtype=np.float64)
                 batches = 0
                 for batch, batch_indices in loader:
+                    batch = batch.to(device, non_blocking=True)
                     if global_step >= target_steps:
                         break
                     if optimizer is None:
@@ -2611,7 +2943,7 @@ def register_geometry_lab(app, experiments_dir):
                             values[0] = values[0] + tc_penalty
                             values[3] = tc_penalty
                         elif config["model_type"] == "slow_vae":
-                            paired = observations[torch.from_numpy(pair_lookup[batch_indices.numpy()])]
+                            paired = observations[torch.from_numpy(pair_lookup[batch_indices.numpy()])].to(device, non_blocking=True)
                             _, paired_z, _, _ = model(paired)
                             delta = (values[5] - paired_z).abs().clamp_min(1e-8)
                             slow_penalty = float(config["slow_gamma"]) * delta.pow(float(config["slow_alpha"])).sum(1).mean()
@@ -2619,9 +2951,9 @@ def register_geometry_lab(app, experiments_dir):
                             values[3] = slow_penalty
                         elif config["model_type"] in {"pcl", "weakly_supervised_gan"}:
                             pair_discriminator_optimizer.zero_grad(set_to_none=True)
-                            paired = observations[torch.from_numpy(pair_lookup[batch_indices.numpy()])]
+                            paired = observations[torch.from_numpy(pair_lookup[batch_indices.numpy()])].to(device, non_blocking=True)
                             positive, _ = model.encode(paired)
-                            negative = positive[torch.randperm(len(positive))]
+                            negative = positive[torch.randperm(len(positive), device=device)]
                             real_logits = pair_discriminator(values[6], positive)
                             false_logits = pair_discriminator(values[6], negative)
                             pair_loss = .5 * (
@@ -2644,12 +2976,12 @@ def register_geometry_lab(app, experiments_dir):
                             factor_discriminator_optimizer.zero_grad(set_to_none=True)
                             joint = values[5].detach()
                             permuted = torch.stack([
-                                joint[torch.randperm(len(joint)), coordinate]
+                                joint[torch.randperm(len(joint), device=device), coordinate]
                                 for coordinate in range(joint.shape[1])
                             ], dim=1)
                             disc_loss = .5 * (
-                                F.cross_entropy(factor_discriminator(joint), torch.zeros(len(joint), dtype=torch.long))
-                                + F.cross_entropy(factor_discriminator(permuted), torch.ones(len(joint), dtype=torch.long))
+                                F.cross_entropy(factor_discriminator(joint), torch.zeros(len(joint), dtype=torch.long, device=device))
+                                + F.cross_entropy(factor_discriminator(permuted), torch.ones(len(joint), dtype=torch.long, device=device))
                             )
                             disc_loss.backward()
                             factor_discriminator_optimizer.step()
@@ -2665,8 +2997,8 @@ def register_geometry_lab(app, experiments_dir):
                         model.train()
                 model.eval()
                 with torch.no_grad():
-                    val_loss = float(_loss_terms(model, validation_sample, config, len(train_indices))[1]) if len(validation_sample) else 0.0
-                    mu, _ = model.encode(observations[: min(len(observations), 4096)])
+                    val_loss = float(_loss_terms(model, validation_sample.to(device, non_blocking=True), config, len(train_indices))[1]) if len(validation_sample) else 0.0
+                    mu, _ = model.encode(observations[: min(len(observations), 4096)].to(device, non_blocking=True))
                     variance = mu.var(0)
                 row = {
                     "epoch": epoch, "total_loss": sums[0] / max(1, batches),
@@ -2716,7 +3048,7 @@ def register_geometry_lab(app, experiments_dir):
             latent_batches, logvar_batches, error_batches, kl_batches = [], [], [], []
             with torch.no_grad():
                 for start in range(0, len(observations), evaluation_batch_size):
-                    batch = observations[start:start + evaluation_batch_size]
+                    batch = observations[start:start + evaluation_batch_size].to(device, non_blocking=True)
                     raw_reconstructed_batch, _, mu_batch, logvar_batch = model(batch)
                     reconstructed_batch = _reconstruction_mean(raw_reconstructed_batch, config)
                     error_batches.append(((reconstructed_batch - batch) ** 2).flatten(1).sum(1).cpu().numpy())
@@ -2730,7 +3062,7 @@ def register_geometry_lab(app, experiments_dir):
                     elif model.variational:
                         kl_batch = -0.5 * (1 + logvar_batch - mu_batch.pow(2) - logvar_batch.exp()).sum(1)
                     else:
-                        kl_batch = torch.zeros(len(mu_batch))
+                        kl_batch = torch.zeros(len(mu_batch), device=device)
                     kl_batches.append(kl_batch.cpu().numpy())
             latent = np.concatenate(latent_batches)
             latent_logvar = np.concatenate(logvar_batches)
@@ -2743,7 +3075,7 @@ def register_geometry_lab(app, experiments_dir):
             reconstructed_samples = []
             with torch.no_grad():
                 for start in range(0, len(indices), evaluation_batch_size):
-                    sample_batch = observations[torch.from_numpy(indices[start:start + evaluation_batch_size])]
+                    sample_batch = observations[torch.from_numpy(indices[start:start + evaluation_batch_size])].to(device, non_blocking=True)
                     raw_reconstructed_batch, _, _, _ = model(sample_batch)
                     reconstructed_samples.append(_reconstruction_mean(raw_reconstructed_batch, config).cpu().numpy())
             reconstructed_sample = np.concatenate(reconstructed_samples)
@@ -2763,6 +3095,7 @@ def register_geometry_lab(app, experiments_dir):
                 "pca_explained_variance": explained, "metrics": metrics,
                 "training_seed": int(config["seed"]),
                 "seed_source": config["seed_source"],
+                "compute_device": device_metadata,
                 "training_budget": {"unit": config["training_budget_unit"], "requested_steps": int(config["training_steps"]),
                                     "completed_steps": int(global_step), "completed_epochs": int(completed_epochs)},
                 "split_counts": {"train": int(len(train_indices)), "validation": int(len(validation_indices)), "test": int(len(test_indices))},
@@ -2806,7 +3139,9 @@ def register_geometry_lab(app, experiments_dir):
             environment = {
                 "python": sys.version, "platform": platform.platform(), "torch": torch.__version__,
                 "numpy": np.__version__, "cuda_available": torch.cuda.is_available(),
-                "cuda_version": torch.version.cuda, "device": "cpu",
+                "cuda_version": torch.version.cuda, "device": str(device),
+                "requested_device": config["device"], "gpu_name": device_metadata["gpu_name"],
+                "gpu_compute_capability": device_metadata["gpu_compute_capability"],
             }
             (directory / "environment.json").write_text(json.dumps(environment, indent=2), encoding="utf-8")
             (directory / "analysis.json").write_text(json.dumps(analysis), encoding="utf-8")
@@ -2868,6 +3203,12 @@ def register_geometry_lab(app, experiments_dir):
             analysis = json.loads((directory / "analysis.json").read_text(encoding="utf-8"))
             update_job(job_id, status="running", stage="autograd Jacobians", progress=0.1)
             scientific = run_scientific_analysis(model, data, analysis, directory, raw_config)
+            custom_results = run_custom_analyses(
+                model, data, directory, raw_config.get("analysis_plan") or [], root,
+            )
+            if custom_results:
+                scientific["custom_analyses"] = custom_results
+                (directory / "scientific_metrics.json").write_text(json.dumps(scientific), encoding="utf-8")
             update_job(job_id, status="complete", stage="complete", progress=1.0, scientific=scientific)
         except Exception as exc:
             traceback.print_exc()
@@ -2967,6 +3308,7 @@ def register_geometry_lab(app, experiments_dir):
                 "training_steps": config.get("training_steps"), "reconstruction_loss": config.get("reconstruction_loss"),
                 "learning_rate": config.get("learning_rate"), "batch_size": config.get("batch_size"),
                 "latent_dim": config.get("latent_dim"), "beta": config.get("beta"), "seed": config.get("seed"),
+                "device": config.get("device", "auto"),
             }
             if item.get("status") == "queued":
                 queued_position += 1
@@ -3014,7 +3356,9 @@ def register_geometry_lab(app, experiments_dir):
                 "paper_metrics": bool(supplied_analysis.get("paper_metrics", False)),
                 "maximum_test_samples": max(0, int(supplied_analysis.get("maximum_test_samples", 0))),
             }
-            run_scientific = bool(set(analysis_plan) & SCIENTIFIC_ANALYSIS_IDS)
+            run_scientific = bool(set(analysis_plan) & SCIENTIFIC_ANALYSIS_IDS) or any(
+                item.startswith("custom:") for item in analysis_plan
+            )
             queue_id = "queue_" + datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8]
             item = {
                 "id": queue_id, "experiment_id": experiment_id, "experiment_name": experiment.get("name", experiment_id),
@@ -3616,10 +3960,14 @@ def register_geometry_lab(app, experiments_dir):
     def train_sweep_model(data, raw_config, run_directory):
         config = _normalized_training_config(raw_config)
         torch.manual_seed(config["seed"])
+        device, device_metadata = _resolve_training_device(config)
+        config.update(device_metadata)
+        if device.type == "cuda":
+            torch.cuda.manual_seed_all(config["seed"])
         observations = torch.from_numpy(data["observations"]).float()
         train_tensor = observations[torch.from_numpy(data["split"] == 0)]
         val_tensor = observations[torch.from_numpy(data["split"] == 1)]
-        model = GeometryAutoencoder(observations.shape[1], config)
+        model = GeometryAutoencoder(observations.shape[1], config).to(device)
         optimizer = None if config["model_type"] == "random_decoder" else _make_optimizer(model.parameters(), config)
         loader = torch.utils.data.DataLoader(
             train_tensor, batch_size=config["batch_size"], shuffle=True,
@@ -3631,6 +3979,7 @@ def register_geometry_lab(app, experiments_dir):
             model.train()
             sums, batches = np.zeros(4), 0
             for batch in loader:
+                batch = batch.to(device, non_blocking=True)
                 if optimizer is None:
                     with torch.no_grad():
                         values = _loss_terms(model, batch, config)
@@ -3643,8 +3992,8 @@ def register_geometry_lab(app, experiments_dir):
                 batches += 1
             model.eval()
             with torch.no_grad():
-                validation = float(_loss_terms(model, val_tensor, config)[1]) if len(val_tensor) else 0
-                mu, _ = model.encode(observations[:min(4096, len(observations))])
+                validation = float(_loss_terms(model, val_tensor.to(device, non_blocking=True), config)[1]) if len(val_tensor) else 0
+                mu, _ = model.encode(observations[:min(4096, len(observations))].to(device, non_blocking=True))
                 variance = mu.var(0)
             metrics.append({
                 "epoch": epoch, "total_loss": sums[0] / max(1, batches),
@@ -3653,6 +4002,7 @@ def register_geometry_lab(app, experiments_dir):
                 "latent_variance": float(variance.mean()), "active_latent_dimensions": int((variance > .01).sum()),
             })
         run_directory.mkdir(parents=True, exist_ok=True)
+        model = model.cpu()
         torch.save({"model_state_dict": model.state_dict(), "training_config": config, "input_dim": observations.shape[1]}, run_directory / "model.pt")
         with torch.no_grad():
             mu, _ = model.encode(observations[:min(600, len(observations))])

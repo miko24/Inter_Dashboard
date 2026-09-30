@@ -19,7 +19,9 @@ from datetime import datetime
 # Optional binary dependencies can be installed locally beside the dashboard.
 # Keeping this directory on sys.path lets the portable launcher use them without
 # modifying the user's global Python environment.
-for local_packages_name in (".runtime", ".vendor", f".vendor-py{sys.version_info.major}{sys.version_info.minor}"):
+# Insert lower-priority fallbacks first because each directory is placed at
+# index zero. A verified CUDA runtime therefore wins after the server restarts.
+for local_packages_name in (f".vendor-py{sys.version_info.major}{sys.version_info.minor}", ".vendor", ".runtime", ".runtime-cuda"):
     local_packages_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), local_packages_name)
     if os.path.isdir(local_packages_dir) and local_packages_dir not in sys.path:
         sys.path.insert(0, local_packages_dir)
@@ -61,6 +63,15 @@ os.makedirs(EXPERIMENTS_DIR, exist_ok=True)
 # sweep APIs remain backwards compatible.
 from geometry_lab import register_geometry_lab
 register_geometry_lab(app, EXPERIMENTS_DIR)
+
+# Provider-neutral, server-side LLM assistance for paper protocol extraction
+# and evidence-grounded arXiv report drafting.
+from llm_assistant import register_llm_assistant
+register_llm_assistant(app, EXPERIMENTS_DIR)
+
+# Local-only compute detection and isolated official PyTorch CUDA installer.
+from runtime_manager import register_runtime_manager
+register_runtime_manager(app)
 
 # Dedicated regular-VAE orthogonality sweep (linear vs decoder-manifold Gram).
 from orthogonality_experiment import register_orthogonality_experiment

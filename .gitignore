@@ -7,6 +7,7 @@ __pycache__/
 .venv/
 venv/
 dashboard/.runtime/
+dashboard/.runtime-cuda*/
 dashboard/.vendor*/
 
 # Dashboard-generated state and downloaded datasets
@@ -14,6 +15,9 @@ dashboard/experiments/
 dashboard/temp_sweep/
 dashboard/server.stdout.log
 dashboard/server.stderr.log
+dashboard/.llm_credentials.json
+dashboard/ai_protocol_drafts/
+dashboard/ai_reports/
 *.mslab
 
 # Generated research artifacts and previews
