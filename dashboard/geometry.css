@@ -42,10 +42,14 @@ body.geometry-mode .header__status .mode-badge { background: linear-gradient(135
 .geo-field input[type=range] { padding:0; height:18px; accent-color:#5eead4; border:0; box-shadow:none; }
 .geo-check { display:flex; align-items:flex-start; gap:8px; color:var(--text-muted); font-size:.7rem; line-height:1.4; }
 .geo-check input { flex:none; width:14px; height:14px; margin-top:1px; accent-color:#5eead4; }
-.geo-form-actions { display:flex; gap:8px; margin-top:15px; }
+.geo-form-actions { display:flex; flex-wrap:wrap; min-width:0; gap:8px; margin-top:15px; }
+.geo-form-actions .geo-btn { max-width:100%; white-space:normal; overflow-wrap:anywhere; text-align:center; line-height:1.25; }
 .geo-bundle-grid { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:end; gap:10px; margin-bottom:11px; }
 .geo-bundle-grid .geo-btn { min-height:34px; white-space:nowrap; }
 .geo-artifact-head { margin:16px 0 9px; padding-top:13px; border-top:1px solid rgba(139,116,255,.12); }
+.geo-artifact-actions { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); align-items:stretch; }
+.geo-artifact-actions .geo-btn { width:100%; min-width:0; }
+.geo-artifact-actions .geo-export[data-format="notebook"] { grid-column:1 / -1; }
 .geo-btn { appearance:none; display:inline-flex; align-items:center; justify-content:center; gap:7px; border:1px solid rgba(139,116,255,.25); border-radius:9px; padding:9px 12px; color:var(--text-primary); background:rgba(124,92,255,.1); font:700 .72rem inherit; cursor:pointer; transition:.16s ease; text-decoration:none; }
 .geo-btn:hover { transform:translateY(-1px); border-color:rgba(94,234,212,.45); }
 .geo-btn.primary { border:0; color:#07111a; background:linear-gradient(135deg,#5eead4,#7dd3fc); box-shadow:0 7px 20px rgba(45,212,191,.16); }
@@ -204,6 +208,7 @@ body.geometry-mode .header__status .mode-badge { background: linear-gradient(135
   .geo-form-grid { grid-template-columns:1fr; }
   .geo-bundle-grid { grid-template-columns:1fr; }
   .geo-bundle-grid .geo-btn { width:100%; }
+  .geo-artifact-actions { grid-template-columns:repeat(2,minmax(0,1fr)); }
   .geo-field.full, .geo-form-grid > .full { grid-column:auto; }
   .geo-stats { grid-template-columns:1fr 1fr; }
   .geo-sample-pair { grid-template-columns:1fr; }
